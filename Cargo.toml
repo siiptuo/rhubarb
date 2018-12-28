@@ -1,0 +1,11 @@
+[package]
+name = "rhubarb"
+version = "0.1.0"
+authors = ["Tuomas Siipola <siiptuo@kapsi.fi>"]
+edition = "2018"
+
+[dependencies]
+hyper = "0.12.19"
+futures = "0.1.25"
+url = "1.7.2"
+tokio = "0.1.13"
