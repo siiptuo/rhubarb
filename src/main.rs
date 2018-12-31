@@ -112,15 +112,31 @@ impl Storage for HashMapStorage {
     }
 }
 
+fn homepage() -> Response<Body> {
+    Response::builder().body(Body::from("Rhubarb")).unwrap()
+}
+
+fn bad_request(error: &'static str) -> Response<Body> {
+    Response::builder()
+        .status(StatusCode::BAD_REQUEST)
+        .body(Body::from(error))
+        .unwrap()
+}
+
+fn accepted() -> Response<Body> {
+    Response::builder()
+        .status(StatusCode::ACCEPTED)
+        .body(Body::empty())
+        .unwrap()
+}
+
 fn hello(
     req: Request<Body>,
     challenge_generator: impl challenge::Generator + Send + 'static,
     storage: &Arc<Mutex<impl Storage + Send + 'static>>,
 ) -> Box<Future<Item = Response<Body>, Error = hyper::Error> + Send> {
     if req.method() != Method::POST {
-        return Box::new(future::ok(
-            Response::builder().body(Body::from("Rhubarb")).unwrap(),
-        ));
+        return Box::new(future::ok(homepage()));
     }
     let storage = storage.clone();
     let res = req.into_body().concat2().map(move |body| {
@@ -132,62 +148,28 @@ fn hello(
                 "hub.callback" => match Url::parse(&value) {
                     Ok(url) => match url.scheme() {
                         "http" | "https" => callback = Some(value),
-                        _ => {
-                            return Response::builder()
-                                .status(StatusCode::BAD_REQUEST)
-                                .body(Body::from("hub.callback should be a HTTP or HTTPS URL"))
-                                .unwrap();
-                        }
+                        _ => return bad_request("hub.callback should be a HTTP or HTTPS URL"),
                     },
-                    Err(_) => {
-                        return Response::builder()
-                            .status(StatusCode::BAD_REQUEST)
-                            .body(Body::from("hub.callback should be a HTTP or HTTPS URL"))
-                            .unwrap();
-                    }
+                    Err(_) => return bad_request("hub.callback should be a HTTP or HTTPS URL"),
                 },
                 "hub.mode" => match value.as_ref() {
                     "subscribe" | "unsubscribe" => mode = Some(value),
-                    _ => {
-                        return Response::builder()
-                            .status(StatusCode::BAD_REQUEST)
-                            .body(Body::from("hub.mode should be subscribe or unsubscribe"))
-                            .unwrap();
-                    }
+                    _ => return bad_request("hub.mode should be subscribe or unsubscribe"),
                 },
                 "hub.topic" => match Url::parse(&value) {
                     Ok(url) => match url.scheme() {
                         "http" | "https" => topic = Some(value),
-                        _ => {
-                            return Response::builder()
-                                .status(StatusCode::BAD_REQUEST)
-                                .body(Body::from("hub.topic should be a HTTP or HTTPS URL"))
-                                .unwrap();
-                        }
+                        _ => return bad_request("hub.topic should be a HTTP or HTTPS URL"),
                     },
-                    Err(_) => {
-                        return Response::builder()
-                            .status(StatusCode::BAD_REQUEST)
-                            .body(Body::from("hub.topic should be a HTTP or HTTPS URL"))
-                            .unwrap()
-                    }
+                    Err(_) => return bad_request("hub.topic should be a HTTP or HTTPS URL"),
                 },
                 _ => {}
             }
         }
         match (callback, mode, topic) {
-            (None, _, _) => Response::builder()
-                .status(StatusCode::BAD_REQUEST)
-                .body(Body::from("hub.callback required"))
-                .unwrap(),
-            (_, None, _) => Response::builder()
-                .status(StatusCode::BAD_REQUEST)
-                .body(Body::from("hub.mode required"))
-                .unwrap(),
-            (_, _, None) => Response::builder()
-                .status(StatusCode::BAD_REQUEST)
-                .body(Body::from("hub.topic required"))
-                .unwrap(),
+            (None, _, _) => bad_request("hub.callback required"),
+            (_, None, _) => bad_request("hub.mode required"),
+            (_, _, None) => bad_request("hub.topic required"),
             (Some(callback), Some(mode), Some(topic)) => {
                 // Verification of intent
                 let challenge = challenge_generator.generate();
@@ -222,10 +204,7 @@ fn hello(
                     .map_err(|err| eprintln!("callback failed: {}", err));
                 rt::spawn(req);
 
-                Response::builder()
-                    .status(StatusCode::ACCEPTED)
-                    .body(Body::empty())
-                    .unwrap()
+                accepted()
             }
         }
     });
