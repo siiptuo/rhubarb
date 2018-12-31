@@ -129,11 +129,25 @@ fn hello(
         let mut topic = None;
         for (name, value) in form_urlencoded::parse(&body) {
             match name.as_ref() {
-                "hub.callback" => callback = Some(value),
-                "hub.mode" => match value.as_ref() {
-                    "subscribe" | "unsubscribe" => {
-                        mode = Some(value);
+                "hub.callback" => match Url::parse(&value) {
+                    Ok(url) => match url.scheme() {
+                        "http" | "https" => callback = Some(value),
+                        _ => {
+                            return Response::builder()
+                                .status(StatusCode::BAD_REQUEST)
+                                .body(Body::from("hub.callback should be a HTTP or HTTPS URL"))
+                                .unwrap();
+                        }
+                    },
+                    Err(_) => {
+                        return Response::builder()
+                            .status(StatusCode::BAD_REQUEST)
+                            .body(Body::from("hub.callback should be a HTTP or HTTPS URL"))
+                            .unwrap();
                     }
+                },
+                "hub.mode" => match value.as_ref() {
+                    "subscribe" | "unsubscribe" => mode = Some(value),
                     _ => {
                         return Response::builder()
                             .status(StatusCode::BAD_REQUEST)
@@ -141,7 +155,23 @@ fn hello(
                             .unwrap();
                     }
                 },
-                "hub.topic" => topic = Some(value),
+                "hub.topic" => match Url::parse(&value) {
+                    Ok(url) => match url.scheme() {
+                        "http" | "https" => topic = Some(value),
+                        _ => {
+                            return Response::builder()
+                                .status(StatusCode::BAD_REQUEST)
+                                .body(Body::from("hub.topic should be a HTTP or HTTPS URL"))
+                                .unwrap();
+                        }
+                    },
+                    Err(_) => {
+                        return Response::builder()
+                            .status(StatusCode::BAD_REQUEST)
+                            .body(Body::from("hub.topic should be a HTTP or HTTPS URL"))
+                            .unwrap()
+                    }
+                },
                 _ => {}
             }
         }
@@ -246,7 +276,7 @@ mod tests {
         .and_then(|res| {
             assert_eq!(res.status(), StatusCode::OK);
             res.into_body().concat2().map(|body| {
-                assert_eq!(body.as_ref(), b"Rhubarb");
+                assert_eq!(std::str::from_utf8(&body), Ok("Rhubarb"));
             })
         })
         .poll()
@@ -268,7 +298,7 @@ mod tests {
         .and_then(|res| {
             assert_eq!(res.status(), StatusCode::BAD_REQUEST);
             res.into_body().concat2().map(|body| {
-                assert_eq!(body.as_ref(), b"hub.callback required");
+                assert_eq!(std::str::from_utf8(&body), Ok("hub.callback required"));
             })
         })
         .poll()
@@ -352,7 +382,131 @@ mod tests {
         .and_then(|res| {
             assert_eq!(res.status(), StatusCode::BAD_REQUEST);
             res.into_body().concat2().map(|body| {
-                assert_eq!(body.as_ref(), b"hub.topic required");
+                assert_eq!(std::str::from_utf8(&body), Ok("hub.topic required"));
+            })
+        })
+        .poll()
+        .unwrap();
+    }
+
+    #[test]
+    fn hub_callback_not_http() {
+        let storage = Arc::new(Mutex::new(HashMapStorage::new()));
+        let req = Request::builder()
+            .method("POST")
+            .body(Body::from(
+                form_urlencoded::Serializer::new(String::new())
+                    .append_pair("hub.callback", "gopher://callback.local")
+                    .append_pair("hub.mode", "subscribe")
+                    .append_pair("hub.topic", "http://topic.local")
+                    .finish(),
+            ))
+            .unwrap();
+        hello(
+            req,
+            challenge::generators::Static::new("test".to_string()),
+            &storage,
+        )
+        .and_then(|res| {
+            assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+            res.into_body().concat2().map(|body| {
+                assert_eq!(
+                    std::str::from_utf8(&body),
+                    Ok("hub.callback should be a HTTP or HTTPS URL")
+                );
+            })
+        })
+        .poll()
+        .unwrap();
+    }
+
+    #[test]
+    fn hub_callback_not_url() {
+        let storage = Arc::new(Mutex::new(HashMapStorage::new()));
+        let req = Request::builder()
+            .method("POST")
+            .body(Body::from(
+                form_urlencoded::Serializer::new(String::new())
+                    .append_pair("hub.callback", "garbage")
+                    .append_pair("hub.mode", "subscribe")
+                    .append_pair("hub.topic", "http://topic.local")
+                    .finish(),
+            ))
+            .unwrap();
+        hello(
+            req,
+            challenge::generators::Static::new("test".to_string()),
+            &storage,
+        )
+        .and_then(|res| {
+            assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+            res.into_body().concat2().map(|body| {
+                assert_eq!(
+                    std::str::from_utf8(&body),
+                    Ok("hub.callback should be a HTTP or HTTPS URL")
+                );
+            })
+        })
+        .poll()
+        .unwrap();
+    }
+
+    #[test]
+    fn hub_topic_not_http() {
+        let storage = Arc::new(Mutex::new(HashMapStorage::new()));
+        let req = Request::builder()
+            .method("POST")
+            .body(Body::from(
+                form_urlencoded::Serializer::new(String::new())
+                    .append_pair("hub.callback", "http://callback.local")
+                    .append_pair("hub.mode", "subscribe")
+                    .append_pair("hub.topic", "gopher://topic.local")
+                    .finish(),
+            ))
+            .unwrap();
+        hello(
+            req,
+            challenge::generators::Static::new("test".to_string()),
+            &storage,
+        )
+        .and_then(|res| {
+            assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+            res.into_body().concat2().map(|body| {
+                assert_eq!(
+                    std::str::from_utf8(&body),
+                    Ok("hub.topic should be a HTTP or HTTPS URL")
+                );
+            })
+        })
+        .poll()
+        .unwrap();
+    }
+
+    #[test]
+    fn hub_topic_not_url() {
+        let storage = Arc::new(Mutex::new(HashMapStorage::new()));
+        let req = Request::builder()
+            .method("POST")
+            .body(Body::from(
+                form_urlencoded::Serializer::new(String::new())
+                    .append_pair("hub.callback", "http://callback.local")
+                    .append_pair("hub.mode", "subscribe")
+                    .append_pair("hub.topic", "garbage")
+                    .finish(),
+            ))
+            .unwrap();
+        hello(
+            req,
+            challenge::generators::Static::new("test".to_string()),
+            &storage,
+        )
+        .and_then(|res| {
+            assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+            res.into_body().concat2().map(|body| {
+                assert_eq!(
+                    std::str::from_utf8(&body),
+                    Ok("hub.topic should be a HTTP or HTTPS URL")
+                );
             })
         })
         .poll()
