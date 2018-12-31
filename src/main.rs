@@ -3,29 +3,63 @@ use futures::stream::Stream;
 use hyper::rt::{self, Future};
 use hyper::service::service_fn;
 use hyper::{Body, Client, Method, Request, Response, Server, StatusCode};
-use rand::distributions::Alphanumeric;
-use rand::{thread_rng, Rng};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use url::{form_urlencoded, Url};
 
-struct Challenge(String);
+mod challenge {
+    pub struct Challenge(String);
 
-trait ChallengeGenerator {
-    fn generate(self) -> Challenge;
-}
+    impl Challenge {
+        pub fn as_str(&self) -> &str {
+            self.0.as_str()
+        }
 
-struct RandomChallengeGenerator;
-
-impl RandomChallengeGenerator {
-    fn new() -> Self {
-        Self {}
+        pub fn as_bytes(&self) -> &[u8] {
+            self.0.as_bytes()
+        }
     }
-}
 
-impl ChallengeGenerator for RandomChallengeGenerator {
-    fn generate(self) -> Challenge {
-        Challenge(thread_rng().sample_iter(&Alphanumeric).take(32).collect())
+    pub trait Generator {
+        fn generate(self) -> Challenge;
+    }
+
+    pub mod generators {
+        use super::*;
+        use rand::{distributions::Alphanumeric, thread_rng, Rng};
+
+        pub struct Random;
+
+        impl Random {
+            pub fn new() -> Self {
+                Self {}
+            }
+        }
+
+        impl Generator for Random {
+            fn generate(self) -> Challenge {
+                Challenge(thread_rng().sample_iter(&Alphanumeric).take(32).collect())
+            }
+        }
+
+        #[cfg(test)]
+        pub struct Static {
+            challenge: String,
+        }
+
+        #[cfg(test)]
+        impl Static {
+            pub fn new(challenge: String) -> Self {
+                Self { challenge }
+            }
+        }
+
+        #[cfg(test)]
+        impl Generator for Static {
+            fn generate(self) -> Challenge {
+                Challenge(self.challenge)
+            }
+        }
     }
 }
 
@@ -80,7 +114,7 @@ impl Storage for HashMapStorage {
 
 fn hello(
     req: Request<Body>,
-    challenge_generator: impl ChallengeGenerator + Send + 'static,
+    challenge_generator: impl challenge::Generator + Send + 'static,
     storage: &Arc<Mutex<impl Storage + Send + 'static>>,
 ) -> Box<Future<Item = Response<Body>, Error = hyper::Error> + Send> {
     if req.method() != Method::POST {
@@ -132,7 +166,7 @@ fn hello(
                     &[
                         ("hub.mode", mode.as_ref()),
                         ("hub.topic", topic.as_ref()),
-                        ("hub.challenge", challenge.0.as_ref()),
+                        ("hub.challenge", challenge.as_str()),
                         ("hub.lease_seconds", "123"),
                     ],
                 )
@@ -143,7 +177,7 @@ fn hello(
                     .get(verification.into_string().parse().unwrap())
                     .and_then(move |res| {
                         res.into_body().concat2().map(move |body| {
-                            if body.into_bytes() == challenge.0.as_bytes() {
+                            if body.as_ref() == challenge.as_bytes() {
                                 println!("callback ok: challenge accepted");
                                 storage.lock().unwrap().insert(Item {
                                     callback,
@@ -174,7 +208,7 @@ fn main() {
 
     let service = move || {
         let storage = Arc::clone(&storage);
-        service_fn(move |req| hello(req, RandomChallengeGenerator::new(), &storage))
+        service_fn(move |req| hello(req, challenge::generators::Random::new(), &storage))
     };
 
     let server = Server::bind(&addr)
@@ -197,22 +231,6 @@ mod tests {
     use std::thread;
     use tokio::runtime;
 
-    struct StaticChallengeGenerator {
-        challenge: String,
-    }
-
-    impl StaticChallengeGenerator {
-        fn new(challenge: String) -> Self {
-            Self { challenge }
-        }
-    }
-
-    impl ChallengeGenerator for StaticChallengeGenerator {
-        fn generate(self) -> Challenge {
-            Challenge(self.challenge)
-        }
-    }
-
     #[test]
     fn request_homepage() {
         let storage = Arc::new(Mutex::new(HashMapStorage::new()));
@@ -222,7 +240,7 @@ mod tests {
             .unwrap();
         hello(
             req,
-            StaticChallengeGenerator::new("test".to_string()),
+            challenge::generators::Static::new("test".to_string()),
             &storage,
         )
         .and_then(|res| {
@@ -244,7 +262,7 @@ mod tests {
             .unwrap();
         hello(
             req,
-            StaticChallengeGenerator::new("test".to_string()),
+            challenge::generators::Static::new("test".to_string()),
             &storage,
         )
         .and_then(|res| {
@@ -270,7 +288,7 @@ mod tests {
             .unwrap();
         hello(
             req,
-            StaticChallengeGenerator::new("test".to_string()),
+            challenge::generators::Static::new("test".to_string()),
             &storage,
         )
         .and_then(|res| {
@@ -298,7 +316,7 @@ mod tests {
             .unwrap();
         hello(
             req,
-            StaticChallengeGenerator::new("test".to_string()),
+            challenge::generators::Static::new("test".to_string()),
             &storage,
         )
         .and_then(|res| {
@@ -328,7 +346,7 @@ mod tests {
             .unwrap();
         hello(
             req,
-            StaticChallengeGenerator::new("test".to_string()),
+            challenge::generators::Static::new("test".to_string()),
             &storage,
         )
         .and_then(|res| {
@@ -399,7 +417,7 @@ mod tests {
         rt::run(
             hello(
                 req,
-                StaticChallengeGenerator::new("test".to_string()),
+                challenge::generators::Static::new("test".to_string()),
                 &storage,
             )
             .map(|res| {
@@ -473,7 +491,7 @@ mod tests {
         rt::run(
             hello(
                 req,
-                StaticChallengeGenerator::new("test".to_string()),
+                challenge::generators::Static::new("test".to_string()),
                 &storage,
             )
             .map(|res| {
