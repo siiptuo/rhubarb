@@ -143,6 +143,11 @@ fn accepted() -> Response<Body> {
         .unwrap()
 }
 
+enum Mode {
+    Subscribe,
+    Unsubscribe,
+}
+
 fn hello(
     req: Request<Body>,
     challenge_generator: impl challenge::Generator + Send + 'static,
@@ -166,7 +171,8 @@ fn hello(
                     Err(_) => return bad_request("hub.callback should be a HTTP or HTTPS URL"),
                 },
                 "hub.mode" => match value.as_ref() {
-                    "subscribe" | "unsubscribe" => mode = Some(value),
+                    "subscribe" => mode = Some(Mode::Subscribe),
+                    "unsubscribe" => mode = Some(Mode::Unsubscribe),
                     _ => return bad_request("hub.mode should be subscribe or unsubscribe"),
                 },
                 "hub.topic" => match Url::parse(&value) {
@@ -189,7 +195,13 @@ fn hello(
                 let verification = Url::parse_with_params(
                     &callback,
                     &[
-                        ("hub.mode", mode.as_ref()),
+                        (
+                            "hub.mode",
+                            match mode {
+                                Mode::Subscribe => "subscribe",
+                                Mode::Unsubscribe => "unsubscribe",
+                            },
+                        ),
                         ("hub.topic", topic.as_ref()),
                         ("hub.challenge", challenge.as_str()),
                         ("hub.lease_seconds", "123"),
@@ -197,7 +209,6 @@ fn hello(
                 )
                 .unwrap();
                 let callback = callback.to_string();
-                let mode = mode.to_string();
                 let topic = topic.to_string();
                 let req = Client::new()
                     .get(verification.into_string().parse().unwrap())
@@ -205,18 +216,17 @@ fn hello(
                         res.into_body().concat2().map(move |body| {
                             if body.as_ref() == challenge.as_bytes() {
                                 println!("callback ok: challenge accepted");
-                                if mode == "subscribe" {
-                                    storage.lock().unwrap().insert(Item {
+                                match mode {
+                                    Mode::Subscribe => storage.lock().unwrap().insert(Item {
                                         callback,
                                         topic,
                                         lease_seconds: 123,
-                                    });
-                                } else {
-                                    storage.lock().unwrap().remove(Item {
+                                    }),
+                                    Mode::Unsubscribe => storage.lock().unwrap().remove(Item {
                                         callback,
                                         topic,
                                         lease_seconds: 123,
-                                    });
+                                    }),
                                 }
                             } else {
                                 println!("callback failed: invalid challenge");
