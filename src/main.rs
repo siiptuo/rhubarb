@@ -197,6 +197,7 @@ fn hello(
                 )
                 .unwrap();
                 let callback = callback.to_string();
+                let mode = mode.to_string();
                 let topic = topic.to_string();
                 let req = Client::new()
                     .get(verification.into_string().parse().unwrap())
@@ -204,11 +205,19 @@ fn hello(
                         res.into_body().concat2().map(move |body| {
                             if body.as_ref() == challenge.as_bytes() {
                                 println!("callback ok: challenge accepted");
-                                storage.lock().unwrap().insert(Item {
-                                    callback,
-                                    topic,
-                                    lease_seconds: 123,
-                                });
+                                if mode == "subscribe" {
+                                    storage.lock().unwrap().insert(Item {
+                                        callback,
+                                        topic,
+                                        lease_seconds: 123,
+                                    });
+                                } else {
+                                    storage.lock().unwrap().remove(Item {
+                                        callback,
+                                        topic,
+                                        lease_seconds: 123,
+                                    });
+                                }
                             } else {
                                 println!("callback failed: invalid challenge");
                             }
@@ -662,6 +671,85 @@ mod tests {
                 form_urlencoded::Serializer::new(String::new())
                     .append_pair("hub.callback", &callback)
                     .append_pair("hub.mode", "subscribe")
+                    .append_pair("hub.topic", &topic)
+                    .finish(),
+            ))
+            .unwrap();
+
+        rt::run(
+            hello(
+                req,
+                challenge::generators::Static::new("test".to_string()),
+                &storage,
+            )
+            .map(|res| {
+                assert_eq!(res.status(), StatusCode::ACCEPTED);
+            })
+            .map_err(|err| panic!(err)),
+        );
+
+        tx.send(()).unwrap();
+        let requests = subscriber.join().unwrap();
+        assert_eq!(requests, 1);
+
+        assert!(storage.lock().unwrap().get(callback, topic).is_none());
+    }
+
+    #[test]
+    fn unsubscribe_success() {
+        let addr = ([127, 0, 0, 1], 3003).into();
+        let (tx, rx) = futures::sync::oneshot::channel::<()>();
+        let subscriber = thread::spawn(move || {
+            let exec = runtime::current_thread::TaskExecutor::current();
+            let counter = Rc::new(Cell::new(0));
+            let counter2 = counter.clone();
+            let server = Server::bind(&addr)
+                .executor(exec)
+                .serve(move || {
+                    let cnt = counter2.clone();
+                    service_fn_ok(move |req| {
+                        let query = req.uri().query();
+                        assert!(query.is_some());
+                        let params = form_urlencoded::parse(query.unwrap().as_bytes())
+                            .into_owned()
+                            .collect::<HashMap<String, String>>();
+                        assert_eq!(params.get("hub.mode"), Some(&"unsubscribe".to_string()));
+                        assert_eq!(
+                            params.get("hub.topic"),
+                            Some(&"http://topic.local".to_string())
+                        );
+                        assert_eq!(params.get("hub.challenge"), Some(&"test".to_string()));
+                        cnt.set(cnt.get() + 1);
+                        Response::new(Body::from("test"))
+                    })
+                })
+                .with_graceful_shutdown(rx)
+                .map_err(|err| eprintln!("server error: {}", err));
+            runtime::current_thread::Runtime::new()
+                .expect("rt new")
+                .spawn(server)
+                .run()
+                .expect("rt run");
+            counter.get()
+        });
+
+        let mut storage = HashMapStorage::new();
+        storage.insert(Item {
+            callback: format!("http://{}", addr),
+            topic: "http://topic.local".to_string(),
+            lease_seconds: 123,
+        });
+        let storage = Arc::new(Mutex::new(storage));
+
+        let callback = format!("http://{}", addr);
+        let topic = "http://topic.local".to_string();
+
+        let req = Request::builder()
+            .method("POST")
+            .body(Body::from(
+                form_urlencoded::Serializer::new(String::new())
+                    .append_pair("hub.callback", &callback)
+                    .append_pair("hub.mode", "unsubscribe")
                     .append_pair("hub.topic", &topic)
                     .finish(),
             ))
