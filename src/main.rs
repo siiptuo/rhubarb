@@ -72,6 +72,7 @@ struct Item {
 
 trait Storage {
     fn get(&self, callback: String, topic: String) -> Option<Item>;
+    fn list(&self, topic: &str) -> Vec<Item>;
     fn insert(&mut self, item: Item);
     fn remove(&mut self, item: Item);
 }
@@ -98,6 +99,18 @@ impl Storage for HashMapStorage {
                 topic,
                 lease_seconds: *lease_seconds,
             })
+    }
+
+    fn list(&self, topic: &str) -> Vec<Item> {
+        self.hash_map
+            .iter()
+            .filter(|(key, _val)| key.1 == topic)
+            .map(|(key, val)| Item {
+                callback: key.0.clone(),
+                topic: key.1.clone(),
+                lease_seconds: *val,
+            })
+            .collect()
     }
 
     fn insert(&mut self, item: Item) {
@@ -211,6 +224,38 @@ fn hello(
     Box::new(res)
 }
 
+fn content_distribution(
+    storage: &Arc<Mutex<impl Storage + Send + 'static>>,
+    topic: &str,
+    content: &str,
+) -> Box<Future<Item = (), Error = ()> + Send> {
+    let callbacks: Vec<String> = storage
+        .lock()
+        .unwrap()
+        .list(topic)
+        .iter()
+        .map(|item| item.callback.clone())
+        .collect();
+    let topic = topic.to_string();
+    let content = content.to_string();
+    Box::new(future::lazy(move || {
+        for callback in callbacks {
+            let callback2 = callback.clone();
+            let client = Client::new();
+            let req = Request::post(&callback)
+                .header("Link", format!("<TODO>; rel=hub, <{}>; rel=self", topic))
+                .body(Body::from(content.clone()))
+                .unwrap();
+            let post = client
+                .request(req)
+                .map(move |_res| println!("callback to {} successed", callback))
+                .map_err(move |err| eprintln!("callback to {} failed: {}", callback2, err));
+            rt::spawn(post);
+        }
+        Ok(())
+    }))
+}
+
 fn main() {
     let addr = ([127, 0, 0, 1], 3000).into();
     let storage = Arc::new(Mutex::new(HashMapStorage::new()));
@@ -233,6 +278,7 @@ fn main() {
 mod tests {
     use super::*;
 
+    use hyper::header::HeaderValue;
     use hyper::rt::{Future, Stream};
     use hyper::service::service_fn_ok;
     use std::cell::Cell;
@@ -638,5 +684,62 @@ mod tests {
         assert_eq!(requests, 1);
 
         assert!(storage.lock().unwrap().get(callback, topic).is_none());
+    }
+
+    #[test]
+    fn content_distribution_success() {
+        let addr = ([127, 0, 0, 1], 3002).into();
+        let (tx, rx) = futures::sync::oneshot::channel::<()>();
+        let subscriber = thread::spawn(move || {
+            let exec = runtime::current_thread::TaskExecutor::current();
+            let counter = Rc::new(Cell::new(0));
+            let counter2 = counter.clone();
+            let server = Server::bind(&addr)
+                .executor(exec)
+                .serve(move || {
+                    let cnt = counter2.clone();
+                    service_fn(move |req: Request<Body>| {
+                        cnt.set(cnt.get() + 1);
+
+                        assert_eq!(req.method(), Method::POST);
+                        assert_eq!(
+                            req.headers().get("Link"),
+                            Some(&HeaderValue::from_static(
+                                "<TODO>; rel=hub, <http://topic.local>; rel=self"
+                            ))
+                        );
+
+                        req.into_body().concat2().map(move |body| {
+                            assert_eq!(std::str::from_utf8(&body), Ok("breaking news"));
+                            Response::new(Body::empty())
+                        })
+                    })
+                })
+                .with_graceful_shutdown(rx)
+                .map_err(|err| eprintln!("server error: {}", err));
+            runtime::current_thread::Runtime::new()
+                .expect("rt new")
+                .spawn(server)
+                .run()
+                .expect("rt run");
+            counter.get()
+        });
+
+        let mut storage = HashMapStorage::new();
+        storage.insert(Item {
+            callback: format!("http://{}", addr),
+            topic: "http://topic.local".to_string(),
+            lease_seconds: 123,
+        });
+        let storage = Arc::new(Mutex::new(storage));
+
+        rt::run(
+            content_distribution(&storage, "http://topic.local", "breaking news")
+                .map_err(|err| panic!(err)),
+        );
+
+        tx.send(()).unwrap();
+        let requests = subscriber.join().unwrap();
+        assert_eq!(requests, 1);
     }
 }
