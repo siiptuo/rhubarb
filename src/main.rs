@@ -1,8 +1,10 @@
 use futures::future;
 use futures::stream::Stream;
+use hmac::{Hmac, Mac};
 use hyper::rt::{self, Future};
 use hyper::service::service_fn;
-use hyper::{Body, Client, Method, Request, Response, Server, StatusCode};
+use hyper::{header::HeaderValue, Body, Client, Method, Request, Response, Server, StatusCode};
+use sha2::Sha512;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use url::{form_urlencoded, Url};
@@ -68,6 +70,7 @@ struct Item {
     callback: String,
     topic: String,
     lease_seconds: u32,
+    secret: Option<String>,
 }
 
 trait Storage {
@@ -78,7 +81,7 @@ trait Storage {
 }
 
 struct HashMapStorage {
-    hash_map: HashMap<(String, String), u32>,
+    hash_map: HashMap<(String, String), (u32, Option<String>)>,
 }
 
 impl HashMapStorage {
@@ -94,10 +97,11 @@ impl Storage for HashMapStorage {
         println!("get {{ callback: {}, topic: {} }}", callback, topic);
         self.hash_map
             .get(&(callback.clone(), topic.clone()))
-            .map(|lease_seconds| Item {
+            .map(|value| Item {
                 callback,
                 topic,
-                lease_seconds: *lease_seconds,
+                lease_seconds: value.0,
+                secret: value.1.clone(),
             })
     }
 
@@ -108,15 +112,18 @@ impl Storage for HashMapStorage {
             .map(|(key, val)| Item {
                 callback: key.0.clone(),
                 topic: key.1.clone(),
-                lease_seconds: *val,
+                lease_seconds: val.0,
+                secret: val.1.clone(),
             })
             .collect()
     }
 
     fn insert(&mut self, item: Item) {
         println!("insert {:?}", item);
-        self.hash_map
-            .insert((item.callback, item.topic), item.lease_seconds);
+        self.hash_map.insert(
+            (item.callback, item.topic),
+            (item.lease_seconds, item.secret),
+        );
     }
 
     fn remove(&mut self, item: Item) {
@@ -161,6 +168,7 @@ fn hello(
         let mut callback = None;
         let mut mode = None;
         let mut topic = None;
+        let mut secret = None;
         for (name, value) in form_urlencoded::parse(&body) {
             match name.as_ref() {
                 "hub.callback" => match Url::parse(&value) {
@@ -182,6 +190,13 @@ fn hello(
                     },
                     Err(_) => return bad_request("hub.topic should be a HTTP or HTTPS URL"),
                 },
+                "hub.secret" => {
+                    if value.len() < 200 {
+                        secret = Some(value.to_string())
+                    } else {
+                        return bad_request("hub.secret must be less than 200 bytes in length");
+                    }
+                }
                 _ => {}
             }
         }
@@ -221,11 +236,13 @@ fn hello(
                                         callback,
                                         topic,
                                         lease_seconds: 123,
+                                        secret,
                                     }),
                                     Mode::Unsubscribe => storage.lock().unwrap().remove(Item {
                                         callback,
                                         topic,
                                         lease_seconds: 123,
+                                        secret,
                                     }),
                                 }
                             } else {
@@ -248,23 +265,35 @@ fn content_distribution(
     topic: &str,
     content: &str,
 ) -> Box<Future<Item = (), Error = ()> + Send> {
-    let callbacks: Vec<String> = storage
+    let subscribers: Vec<(String, Option<String>)> = storage
         .lock()
         .unwrap()
         .list(topic)
         .iter()
-        .map(|item| item.callback.clone())
+        .map(|item| (item.callback.clone(), item.secret.clone()))
         .collect();
     let topic = topic.to_string();
     let content = content.to_string();
     Box::new(future::lazy(move || {
-        for callback in callbacks {
+        for (callback, secret) in subscribers {
             let callback2 = callback.clone();
             let client = Client::new();
-            let req = Request::post(&callback)
-                .header("Link", format!("<TODO>; rel=hub, <{}>; rel=self", topic))
-                .body(Body::from(content.clone()))
-                .unwrap();
+            let mut req = Request::new(Body::from(content.clone()));
+            *req.method_mut() = Method::POST;
+            *req.uri_mut() = callback.parse().unwrap();
+            let headers = req.headers_mut();
+            headers.insert(
+                "Link",
+                HeaderValue::from_str(&format!("<TODO>; rel=hub, <{}>; rel=self", topic)).unwrap(),
+            );
+            if let Some(secret) = secret {
+                let mut mac = Hmac::<Sha512>::new_varkey(secret.as_bytes()).unwrap();
+                mac.input(content.as_bytes());
+                headers.insert(
+                    "X-Hub-Signature",
+                    HeaderValue::from_str(&format!("sha512={:x}", mac.result().code())).unwrap(),
+                );
+            }
             let post = client
                 .request(req)
                 .map(move |_res| println!("callback to {} successed", callback))
@@ -297,7 +326,6 @@ fn main() {
 mod tests {
     use super::*;
 
-    use hyper::header::HeaderValue;
     use hyper::rt::{Future, Stream};
     use hyper::service::service_fn_ok;
     use std::cell::Cell;
@@ -558,8 +586,121 @@ mod tests {
     }
 
     #[test]
-    fn subscribe_success() {
+    fn hub_too_long_secret() {
+        let storage = Arc::new(Mutex::new(HashMapStorage::new()));
+        let req = Request::builder()
+            .method("POST")
+            .body(Body::from(
+                form_urlencoded::Serializer::new(String::new())
+                    .append_pair("hub.callback", "http://callback.local")
+                    .append_pair("hub.mode", "subscribe")
+                    .append_pair("hub.topic", "http://topic.local")
+                    .append_pair("hub.secret", &"!".repeat(200))
+                    .finish(),
+            ))
+            .unwrap();
+        hello(
+            req,
+            challenge::generators::Static::new("test".to_string()),
+            &storage,
+        )
+        .and_then(|res| {
+            assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+            res.into_body().concat2().map(|body| {
+                assert_eq!(
+                    std::str::from_utf8(&body),
+                    Ok("hub.secret must be less than 200 bytes in length")
+                );
+            })
+        })
+        .poll()
+        .unwrap();
+    }
+
+    #[test]
+    fn subscribe_with_secret_success() {
         let addr = ([127, 0, 0, 1], 3000).into();
+        let (tx, rx) = futures::sync::oneshot::channel::<()>();
+        let subscriber = thread::spawn(move || {
+            let exec = runtime::current_thread::TaskExecutor::current();
+            let counter = Rc::new(Cell::new(0));
+            let counter2 = counter.clone();
+            let server = Server::bind(&addr)
+                .executor(exec)
+                .serve(move || {
+                    let cnt = counter2.clone();
+                    service_fn_ok(move |req| {
+                        let query = req.uri().query();
+                        assert!(query.is_some());
+                        let params = form_urlencoded::parse(query.unwrap().as_bytes())
+                            .into_owned()
+                            .collect::<HashMap<String, String>>();
+                        assert_eq!(params.get("hub.mode"), Some(&"subscribe".to_string()));
+                        assert_eq!(
+                            params.get("hub.topic"),
+                            Some(&"http://topic.local".to_string())
+                        );
+                        assert_eq!(params.get("hub.challenge"), Some(&"test".to_string()));
+                        assert_eq!(params.get("hub.lease_seconds"), Some(&"123".to_string()));
+                        cnt.set(cnt.get() + 1);
+                        Response::new(Body::from("test"))
+                    })
+                })
+                .with_graceful_shutdown(rx)
+                .map_err(|err| eprintln!("server error: {}", err));
+            runtime::current_thread::Runtime::new()
+                .expect("rt new")
+                .spawn(server)
+                .run()
+                .expect("rt run");
+            counter.get()
+        });
+
+        let storage = Arc::new(Mutex::new(HashMapStorage::new()));
+
+        let callback = format!("http://{}", addr);
+        let topic = "http://topic.local".to_string();
+
+        let req = Request::builder()
+            .method("POST")
+            .body(Body::from(
+                form_urlencoded::Serializer::new(String::new())
+                    .append_pair("hub.callback", &callback)
+                    .append_pair("hub.mode", "subscribe")
+                    .append_pair("hub.topic", &topic)
+                    .append_pair("hub.secret", "mysecret")
+                    .finish(),
+            ))
+            .unwrap();
+
+        rt::run(
+            hello(
+                req,
+                challenge::generators::Static::new("test".to_string()),
+                &storage,
+            )
+            .map(|res| {
+                assert_eq!(res.status(), StatusCode::ACCEPTED);
+            })
+            .map_err(|err| panic!(err)),
+        );
+
+        tx.send(()).unwrap();
+        let requests = subscriber.join().unwrap();
+        assert_eq!(requests, 1);
+
+        let item = storage
+            .lock()
+            .unwrap()
+            .get(callback, topic)
+            .expect("Item not found");
+        assert_eq!(item.lease_seconds, 123);
+        assert_eq!(item.secret, Some("mysecret".to_string()));
+    }
+
+    #[test]
+    fn subscribe_without_secret_success() {
+        let addr = ([127, 0, 0, 1], 3004).into();
         let (tx, rx) = futures::sync::oneshot::channel::<()>();
         let subscriber = thread::spawn(move || {
             let exec = runtime::current_thread::TaskExecutor::current();
@@ -628,7 +769,13 @@ mod tests {
         let requests = subscriber.join().unwrap();
         assert_eq!(requests, 1);
 
-        assert!(storage.lock().unwrap().get(callback, topic).is_some());
+        let item = storage
+            .lock()
+            .unwrap()
+            .get(callback, topic)
+            .expect("Item not found");
+        assert_eq!(item.lease_seconds, 123);
+        assert_eq!(item.secret, None);
     }
 
     #[test]
@@ -748,6 +895,7 @@ mod tests {
             callback: format!("http://{}", addr),
             topic: "http://topic.local".to_string(),
             lease_seconds: 123,
+            secret: None,
         });
         let storage = Arc::new(Mutex::new(storage));
 
@@ -806,6 +954,7 @@ mod tests {
                                 "<TODO>; rel=hub, <http://topic.local>; rel=self"
                             ))
                         );
+                        assert!(req.headers().get("X-Hub-Signature").is_none());
 
                         req.into_body().concat2().map(move |body| {
                             assert_eq!(std::str::from_utf8(&body), Ok("breaking news"));
@@ -828,6 +977,69 @@ mod tests {
             callback: format!("http://{}", addr),
             topic: "http://topic.local".to_string(),
             lease_seconds: 123,
+            secret: None,
+        });
+        let storage = Arc::new(Mutex::new(storage));
+
+        rt::run(
+            content_distribution(&storage, "http://topic.local", "breaking news")
+                .map_err(|err| panic!(err)),
+        );
+
+        tx.send(()).unwrap();
+        let requests = subscriber.join().unwrap();
+        assert_eq!(requests, 1);
+    }
+
+    #[test]
+    fn authenticated_content_distribution_success() {
+        let addr = ([127, 0, 0, 1], 3005).into();
+        let (tx, rx) = futures::sync::oneshot::channel::<()>();
+        let subscriber = thread::spawn(move || {
+            let exec = runtime::current_thread::TaskExecutor::current();
+            let counter = Rc::new(Cell::new(0));
+            let counter2 = counter.clone();
+            let server = Server::bind(&addr)
+                .executor(exec)
+                .serve(move || {
+                    let cnt = counter2.clone();
+                    service_fn(move |req: Request<Body>| {
+                        cnt.set(cnt.get() + 1);
+
+                        assert_eq!(req.method(), Method::POST);
+                        assert_eq!(
+                            req.headers().get("Link"),
+                            Some(&HeaderValue::from_static(
+                                "<TODO>; rel=hub, <http://topic.local>; rel=self"
+                            ))
+                        );
+                        assert_eq!(
+                            req.headers().get("X-Hub-Signature"),
+                            Some(&HeaderValue::from_static("sha512=0f18aaef5a69a9bce743a284ffd054cb24a9faa349931f338015d32d0e37c2c01c4a95afc4173f5cc57e4c161c528dd68e13f0f00e37036224feaf438b2fd49b"))
+                        );
+
+                        req.into_body().concat2().map(move |body| {
+                            assert_eq!(std::str::from_utf8(&body), Ok("breaking news"));
+                            Response::new(Body::empty())
+                        })
+                    })
+                })
+                .with_graceful_shutdown(rx)
+                .map_err(|err| eprintln!("server error: {}", err));
+            runtime::current_thread::Runtime::new()
+                .expect("rt new")
+                .spawn(server)
+                .run()
+                .expect("rt run");
+            counter.get()
+        });
+
+        let mut storage = HashMapStorage::new();
+        storage.insert(Item {
+            callback: format!("http://{}", addr),
+            topic: "http://topic.local".to_string(),
+            lease_seconds: 123,
+            secret: Some("mysecret".to_string()),
         });
         let storage = Arc::new(Mutex::new(storage));
 
