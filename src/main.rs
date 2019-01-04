@@ -7,6 +7,7 @@ use hyper::{header::HeaderValue, Body, Client, Method, Request, Response, Server
 use sha2::Sha512;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+use std::time::SystemTime;
 use url::{form_urlencoded, Url};
 
 mod challenge {
@@ -69,7 +70,7 @@ mod challenge {
 struct Item {
     callback: String,
     topic: String,
-    lease_seconds: u32,
+    expires: u64,
     secret: Option<String>,
 }
 
@@ -81,7 +82,7 @@ trait Storage {
 }
 
 struct HashMapStorage {
-    hash_map: HashMap<(String, String), (u32, Option<String>)>,
+    hash_map: HashMap<(String, String), (u64, Option<String>)>,
 }
 
 impl HashMapStorage {
@@ -100,7 +101,7 @@ impl Storage for HashMapStorage {
             .map(|value| Item {
                 callback,
                 topic,
-                lease_seconds: value.0,
+                expires: value.0,
                 secret: value.1.clone(),
             })
     }
@@ -112,7 +113,7 @@ impl Storage for HashMapStorage {
             .map(|(key, val)| Item {
                 callback: key.0.clone(),
                 topic: key.1.clone(),
-                lease_seconds: val.0,
+                expires: val.0,
                 secret: val.1.clone(),
             })
             .collect()
@@ -120,10 +121,8 @@ impl Storage for HashMapStorage {
 
     fn insert(&mut self, item: Item) {
         println!("insert {:?}", item);
-        self.hash_map.insert(
-            (item.callback, item.topic),
-            (item.lease_seconds, item.secret),
-        );
+        self.hash_map
+            .insert((item.callback, item.topic), (item.expires, item.secret));
     }
 
     fn remove(&mut self, item: Item) {
@@ -159,6 +158,7 @@ fn hello(
     req: Request<Body>,
     challenge_generator: impl challenge::Generator + Send + 'static,
     storage: &Arc<Mutex<impl Storage + Send + 'static>>,
+    timestamp: u64,
 ) -> Box<Future<Item = Response<Body>, Error = hyper::Error> + Send> {
     if req.method() != Method::POST {
         return Box::new(future::ok(homepage()));
@@ -168,6 +168,7 @@ fn hello(
         let mut callback = None;
         let mut mode = None;
         let mut topic = None;
+        let mut lease_seconds = 123;
         let mut secret = None;
         for (name, value) in form_urlencoded::parse(&body) {
             match name.as_ref() {
@@ -189,6 +190,10 @@ fn hello(
                         _ => return bad_request("hub.topic should be a HTTP or HTTPS URL"),
                     },
                     Err(_) => return bad_request("hub.topic should be a HTTP or HTTPS URL"),
+                },
+                "hub.lease_seconds" => match &value.parse::<u64>() {
+                    Ok(val) => lease_seconds = *val,
+                    Err(_) => return bad_request("hub.lease_seconds must be a positive integer"),
                 },
                 "hub.secret" => {
                     if value.len() < 200 {
@@ -219,7 +224,7 @@ fn hello(
                         ),
                         ("hub.topic", topic.as_ref()),
                         ("hub.challenge", challenge.as_str()),
-                        ("hub.lease_seconds", "123"),
+                        ("hub.lease_seconds", &lease_seconds.to_string()),
                     ],
                 )
                 .unwrap();
@@ -235,13 +240,13 @@ fn hello(
                                     Mode::Subscribe => storage.lock().unwrap().insert(Item {
                                         callback,
                                         topic,
-                                        lease_seconds: 123,
+                                        expires: timestamp + lease_seconds,
                                         secret,
                                     }),
                                     Mode::Unsubscribe => storage.lock().unwrap().remove(Item {
                                         callback,
                                         topic,
-                                        lease_seconds: 123,
+                                        expires: timestamp + lease_seconds,
                                         secret,
                                     }),
                                 }
@@ -262,6 +267,7 @@ fn hello(
 
 fn content_distribution(
     storage: &Arc<Mutex<impl Storage + Send + 'static>>,
+    timestamp: u64,
     topic: &str,
     content: &str,
 ) -> Box<Future<Item = (), Error = ()> + Send> {
@@ -270,6 +276,7 @@ fn content_distribution(
         .unwrap()
         .list(topic)
         .iter()
+        .filter(|item| item.expires > timestamp)
         .map(|item| (item.callback.clone(), item.secret.clone()))
         .collect();
     let topic = topic.to_string();
@@ -304,13 +311,27 @@ fn content_distribution(
     }))
 }
 
+fn current_timestamp() -> u64 {
+    SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+}
+
 fn main() {
     let addr = ([127, 0, 0, 1], 3000).into();
     let storage = Arc::new(Mutex::new(HashMapStorage::new()));
 
     let service = move || {
         let storage = Arc::clone(&storage);
-        service_fn(move |req| hello(req, challenge::generators::Random::new(), &storage))
+        service_fn(move |req| {
+            hello(
+                req,
+                challenge::generators::Random::new(),
+                &storage,
+                current_timestamp(),
+            )
+        })
     };
 
     let server = Server::bind(&addr)
@@ -334,7 +355,8 @@ mod tests {
     use tokio::runtime;
 
     #[test]
-    fn request_homepage() {
+    fn release_secondsquest_homepage() {
+        let timestamp = 1500000000;
         let storage = Arc::new(Mutex::new(HashMapStorage::new()));
         let req = Request::builder()
             .method("GET")
@@ -344,6 +366,7 @@ mod tests {
             req,
             challenge::generators::Static::new("test".to_string()),
             &storage,
+            timestamp,
         )
         .and_then(|res| {
             assert_eq!(res.status(), StatusCode::OK);
@@ -357,6 +380,7 @@ mod tests {
 
     #[test]
     fn hub_callback_required() {
+        let timestamp = 1500000000;
         let storage = Arc::new(Mutex::new(HashMapStorage::new()));
         let req = Request::builder()
             .method("POST")
@@ -366,6 +390,7 @@ mod tests {
             req,
             challenge::generators::Static::new("test".to_string()),
             &storage,
+            timestamp,
         )
         .and_then(|res| {
             assert_eq!(res.status(), StatusCode::BAD_REQUEST);
@@ -379,6 +404,7 @@ mod tests {
 
     #[test]
     fn hub_mode_required() {
+        let timestamp = 1500000000;
         let storage = Arc::new(Mutex::new(HashMapStorage::new()));
         let req = Request::builder()
             .method("POST")
@@ -392,6 +418,7 @@ mod tests {
             req,
             challenge::generators::Static::new("test".to_string()),
             &storage,
+            timestamp,
         )
         .and_then(|res| {
             assert_eq!(res.status(), StatusCode::BAD_REQUEST);
@@ -405,6 +432,7 @@ mod tests {
 
     #[test]
     fn hub_mode_invalid() {
+        let timestamp = 1500000000;
         let storage = Arc::new(Mutex::new(HashMapStorage::new()));
         let req = Request::builder()
             .method("POST")
@@ -420,6 +448,7 @@ mod tests {
             req,
             challenge::generators::Static::new("test".to_string()),
             &storage,
+            timestamp,
         )
         .and_then(|res| {
             assert_eq!(res.status(), StatusCode::BAD_REQUEST);
@@ -436,6 +465,7 @@ mod tests {
 
     #[test]
     fn hub_topic_required() {
+        let timestamp = 1500000000;
         let storage = Arc::new(Mutex::new(HashMapStorage::new()));
         let req = Request::builder()
             .method("POST")
@@ -450,6 +480,7 @@ mod tests {
             req,
             challenge::generators::Static::new("test".to_string()),
             &storage,
+            timestamp,
         )
         .and_then(|res| {
             assert_eq!(res.status(), StatusCode::BAD_REQUEST);
@@ -463,6 +494,7 @@ mod tests {
 
     #[test]
     fn hub_callback_not_http() {
+        let timestamp = 1500000000;
         let storage = Arc::new(Mutex::new(HashMapStorage::new()));
         let req = Request::builder()
             .method("POST")
@@ -478,6 +510,7 @@ mod tests {
             req,
             challenge::generators::Static::new("test".to_string()),
             &storage,
+            timestamp,
         )
         .and_then(|res| {
             assert_eq!(res.status(), StatusCode::BAD_REQUEST);
@@ -494,6 +527,7 @@ mod tests {
 
     #[test]
     fn hub_callback_not_url() {
+        let timestamp = 1500000000;
         let storage = Arc::new(Mutex::new(HashMapStorage::new()));
         let req = Request::builder()
             .method("POST")
@@ -509,6 +543,7 @@ mod tests {
             req,
             challenge::generators::Static::new("test".to_string()),
             &storage,
+            timestamp,
         )
         .and_then(|res| {
             assert_eq!(res.status(), StatusCode::BAD_REQUEST);
@@ -525,6 +560,7 @@ mod tests {
 
     #[test]
     fn hub_topic_not_http() {
+        let timestamp = 1500000000;
         let storage = Arc::new(Mutex::new(HashMapStorage::new()));
         let req = Request::builder()
             .method("POST")
@@ -540,6 +576,7 @@ mod tests {
             req,
             challenge::generators::Static::new("test".to_string()),
             &storage,
+            timestamp,
         )
         .and_then(|res| {
             assert_eq!(res.status(), StatusCode::BAD_REQUEST);
@@ -556,6 +593,7 @@ mod tests {
 
     #[test]
     fn hub_topic_not_url() {
+        let timestamp = 1500000000;
         let storage = Arc::new(Mutex::new(HashMapStorage::new()));
         let req = Request::builder()
             .method("POST")
@@ -571,6 +609,7 @@ mod tests {
             req,
             challenge::generators::Static::new("test".to_string()),
             &storage,
+            timestamp,
         )
         .and_then(|res| {
             assert_eq!(res.status(), StatusCode::BAD_REQUEST);
@@ -586,7 +625,76 @@ mod tests {
     }
 
     #[test]
+    fn hub_lease_seconds_not_integer() {
+        let timestamp = 1500000000;
+        let storage = Arc::new(Mutex::new(HashMapStorage::new()));
+        let req = Request::builder()
+            .method("POST")
+            .body(Body::from(
+                form_urlencoded::Serializer::new(String::new())
+                    .append_pair("hub.callback", "http://callback.local")
+                    .append_pair("hub.mode", "subscribe")
+                    .append_pair("hub.topic", "http://topic.local")
+                    .append_pair("hub.lease_seconds", "garbage")
+                    .finish(),
+            ))
+            .unwrap();
+        hello(
+            req,
+            challenge::generators::Static::new("test".to_string()),
+            &storage,
+            timestamp,
+        )
+        .and_then(|res| {
+            assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+            res.into_body().concat2().map(|body| {
+                assert_eq!(
+                    std::str::from_utf8(&body),
+                    Ok("hub.lease_seconds must be a positive integer")
+                );
+            })
+        })
+        .poll()
+        .unwrap();
+    }
+
+    #[test]
+    fn hub_lease_seconds_negative() {
+        let timestamp = 1500000000;
+        let storage = Arc::new(Mutex::new(HashMapStorage::new()));
+        let req = Request::builder()
+            .method("POST")
+            .body(Body::from(
+                form_urlencoded::Serializer::new(String::new())
+                    .append_pair("hub.callback", "http://callback.local")
+                    .append_pair("hub.mode", "subscribe")
+                    .append_pair("hub.topic", "http://topic.local")
+                    .append_pair("hub.lease_seconds", "-123")
+                    .finish(),
+            ))
+            .unwrap();
+        hello(
+            req,
+            challenge::generators::Static::new("test".to_string()),
+            &storage,
+            timestamp,
+        )
+        .and_then(|res| {
+            assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+            res.into_body().concat2().map(|body| {
+                assert_eq!(
+                    std::str::from_utf8(&body),
+                    Ok("hub.lease_seconds must be a positive integer")
+                );
+            })
+        })
+        .poll()
+        .unwrap();
+    }
+
+    #[test]
     fn hub_too_long_secret() {
+        let timestamp = 1500000000;
         let storage = Arc::new(Mutex::new(HashMapStorage::new()));
         let req = Request::builder()
             .method("POST")
@@ -603,6 +711,7 @@ mod tests {
             req,
             challenge::generators::Static::new("test".to_string()),
             &storage,
+            timestamp,
         )
         .and_then(|res| {
             assert_eq!(res.status(), StatusCode::BAD_REQUEST);
@@ -615,6 +724,171 @@ mod tests {
         })
         .poll()
         .unwrap();
+    }
+
+    #[test]
+    fn subscribe_minimal_success() {
+        let addr = ([127, 0, 0, 1], 3004).into();
+        let (tx, rx) = futures::sync::oneshot::channel::<()>();
+        let subscriber = thread::spawn(move || {
+            let exec = runtime::current_thread::TaskExecutor::current();
+            let counter = Rc::new(Cell::new(0));
+            let counter2 = counter.clone();
+            let server = Server::bind(&addr)
+                .executor(exec)
+                .serve(move || {
+                    let cnt = counter2.clone();
+                    service_fn_ok(move |req| {
+                        let query = req.uri().query();
+                        assert!(query.is_some());
+                        let params = form_urlencoded::parse(query.unwrap().as_bytes())
+                            .into_owned()
+                            .collect::<HashMap<String, String>>();
+                        assert_eq!(params.get("hub.mode"), Some(&"subscribe".to_string()));
+                        assert_eq!(
+                            params.get("hub.topic"),
+                            Some(&"http://topic.local".to_string())
+                        );
+                        assert_eq!(params.get("hub.challenge"), Some(&"test".to_string()));
+                        assert_eq!(params.get("hub.lease_seconds"), Some(&"123".to_string()));
+                        cnt.set(cnt.get() + 1);
+                        Response::new(Body::from("test"))
+                    })
+                })
+                .with_graceful_shutdown(rx)
+                .map_err(|err| eprintln!("server error: {}", err));
+            runtime::current_thread::Runtime::new()
+                .expect("rt new")
+                .spawn(server)
+                .run()
+                .expect("rt run");
+            counter.get()
+        });
+
+        let timestamp = 1500000000;
+        let storage = Arc::new(Mutex::new(HashMapStorage::new()));
+
+        let callback = format!("http://{}", addr);
+        let topic = "http://topic.local".to_string();
+
+        let req = Request::builder()
+            .method("POST")
+            .body(Body::from(
+                form_urlencoded::Serializer::new(String::new())
+                    .append_pair("hub.callback", &callback)
+                    .append_pair("hub.mode", "subscribe")
+                    .append_pair("hub.topic", &topic)
+                    .finish(),
+            ))
+            .unwrap();
+
+        rt::run(
+            hello(
+                req,
+                challenge::generators::Static::new("test".to_string()),
+                &storage,
+                timestamp,
+            )
+            .map(|res| {
+                assert_eq!(res.status(), StatusCode::ACCEPTED);
+            })
+            .map_err(|err| panic!(err)),
+        );
+
+        tx.send(()).unwrap();
+        let requests = subscriber.join().unwrap();
+        assert_eq!(requests, 1);
+
+        let item = storage
+            .lock()
+            .unwrap()
+            .get(callback, topic)
+            .expect("Item not found");
+        assert_eq!(item.expires, timestamp + 123);
+        assert_eq!(item.secret, None);
+    }
+
+    #[test]
+    fn subscribe_with_lease_seconds_success() {
+        let addr = ([127, 0, 0, 1], 3006).into();
+        let (tx, rx) = futures::sync::oneshot::channel::<()>();
+        let subscriber = thread::spawn(move || {
+            let exec = runtime::current_thread::TaskExecutor::current();
+            let counter = Rc::new(Cell::new(0));
+            let counter2 = counter.clone();
+            let server = Server::bind(&addr)
+                .executor(exec)
+                .serve(move || {
+                    let cnt = counter2.clone();
+                    service_fn_ok(move |req| {
+                        let query = req.uri().query();
+                        assert!(query.is_some());
+                        let params = form_urlencoded::parse(query.unwrap().as_bytes())
+                            .into_owned()
+                            .collect::<HashMap<String, String>>();
+                        assert_eq!(params.get("hub.mode"), Some(&"subscribe".to_string()));
+                        assert_eq!(
+                            params.get("hub.topic"),
+                            Some(&"http://topic.local".to_string())
+                        );
+                        assert_eq!(params.get("hub.challenge"), Some(&"test".to_string()));
+                        assert_eq!(params.get("hub.lease_seconds"), Some(&"321".to_string()));
+                        cnt.set(cnt.get() + 1);
+                        Response::new(Body::from("test"))
+                    })
+                })
+                .with_graceful_shutdown(rx)
+                .map_err(|err| eprintln!("server error: {}", err));
+            runtime::current_thread::Runtime::new()
+                .expect("rt new")
+                .spawn(server)
+                .run()
+                .expect("rt run");
+            counter.get()
+        });
+
+        let storage = Arc::new(Mutex::new(HashMapStorage::new()));
+
+        let callback = format!("http://{}", addr);
+        let topic = "http://topic.local".to_string();
+        let timestamp = 1500000000;
+
+        let req = Request::builder()
+            .method("POST")
+            .body(Body::from(
+                form_urlencoded::Serializer::new(String::new())
+                    .append_pair("hub.callback", &callback)
+                    .append_pair("hub.mode", "subscribe")
+                    .append_pair("hub.topic", &topic)
+                    .append_pair("hub.lease_seconds", "321")
+                    .finish(),
+            ))
+            .unwrap();
+
+        rt::run(
+            hello(
+                req,
+                challenge::generators::Static::new("test".to_string()),
+                &storage,
+                timestamp,
+            )
+            .map(|res| {
+                assert_eq!(res.status(), StatusCode::ACCEPTED);
+            })
+            .map_err(|err| panic!(err)),
+        );
+
+        tx.send(()).unwrap();
+        let requests = subscriber.join().unwrap();
+        assert_eq!(requests, 1);
+
+        let item = storage
+            .lock()
+            .unwrap()
+            .get(callback, topic)
+            .expect("Item not found");
+        assert_eq!(item.expires, timestamp + 321);
+        assert_eq!(item.secret, None);
     }
 
     #[test]
@@ -656,6 +930,7 @@ mod tests {
             counter.get()
         });
 
+        let timestamp = 1500000000;
         let storage = Arc::new(Mutex::new(HashMapStorage::new()));
 
         let callback = format!("http://{}", addr);
@@ -678,6 +953,7 @@ mod tests {
                 req,
                 challenge::generators::Static::new("test".to_string()),
                 &storage,
+                timestamp,
             )
             .map(|res| {
                 assert_eq!(res.status(), StatusCode::ACCEPTED);
@@ -694,88 +970,8 @@ mod tests {
             .unwrap()
             .get(callback, topic)
             .expect("Item not found");
-        assert_eq!(item.lease_seconds, 123);
+        assert_eq!(item.expires, timestamp + 123);
         assert_eq!(item.secret, Some("mysecret".to_string()));
-    }
-
-    #[test]
-    fn subscribe_without_secret_success() {
-        let addr = ([127, 0, 0, 1], 3004).into();
-        let (tx, rx) = futures::sync::oneshot::channel::<()>();
-        let subscriber = thread::spawn(move || {
-            let exec = runtime::current_thread::TaskExecutor::current();
-            let counter = Rc::new(Cell::new(0));
-            let counter2 = counter.clone();
-            let server = Server::bind(&addr)
-                .executor(exec)
-                .serve(move || {
-                    let cnt = counter2.clone();
-                    service_fn_ok(move |req| {
-                        let query = req.uri().query();
-                        assert!(query.is_some());
-                        let params = form_urlencoded::parse(query.unwrap().as_bytes())
-                            .into_owned()
-                            .collect::<HashMap<String, String>>();
-                        assert_eq!(params.get("hub.mode"), Some(&"subscribe".to_string()));
-                        assert_eq!(
-                            params.get("hub.topic"),
-                            Some(&"http://topic.local".to_string())
-                        );
-                        assert_eq!(params.get("hub.challenge"), Some(&"test".to_string()));
-                        assert_eq!(params.get("hub.lease_seconds"), Some(&"123".to_string()));
-                        cnt.set(cnt.get() + 1);
-                        Response::new(Body::from("test"))
-                    })
-                })
-                .with_graceful_shutdown(rx)
-                .map_err(|err| eprintln!("server error: {}", err));
-            runtime::current_thread::Runtime::new()
-                .expect("rt new")
-                .spawn(server)
-                .run()
-                .expect("rt run");
-            counter.get()
-        });
-
-        let storage = Arc::new(Mutex::new(HashMapStorage::new()));
-
-        let callback = format!("http://{}", addr);
-        let topic = "http://topic.local".to_string();
-
-        let req = Request::builder()
-            .method("POST")
-            .body(Body::from(
-                form_urlencoded::Serializer::new(String::new())
-                    .append_pair("hub.callback", &callback)
-                    .append_pair("hub.mode", "subscribe")
-                    .append_pair("hub.topic", &topic)
-                    .finish(),
-            ))
-            .unwrap();
-
-        rt::run(
-            hello(
-                req,
-                challenge::generators::Static::new("test".to_string()),
-                &storage,
-            )
-            .map(|res| {
-                assert_eq!(res.status(), StatusCode::ACCEPTED);
-            })
-            .map_err(|err| panic!(err)),
-        );
-
-        tx.send(()).unwrap();
-        let requests = subscriber.join().unwrap();
-        assert_eq!(requests, 1);
-
-        let item = storage
-            .lock()
-            .unwrap()
-            .get(callback, topic)
-            .expect("Item not found");
-        assert_eq!(item.lease_seconds, 123);
-        assert_eq!(item.secret, None);
     }
 
     #[test]
@@ -817,6 +1013,7 @@ mod tests {
             counter.get()
         });
 
+        let timestamp = 1500000000;
         let storage = Arc::new(Mutex::new(HashMapStorage::new()));
 
         let callback = format!("http://{}", addr);
@@ -838,6 +1035,7 @@ mod tests {
                 req,
                 challenge::generators::Static::new("test".to_string()),
                 &storage,
+                timestamp,
             )
             .map(|res| {
                 assert_eq!(res.status(), StatusCode::ACCEPTED);
@@ -890,11 +1088,13 @@ mod tests {
             counter.get()
         });
 
+        let timestamp = 1500000000;
+
         let mut storage = HashMapStorage::new();
         storage.insert(Item {
             callback: format!("http://{}", addr),
             topic: "http://topic.local".to_string(),
-            lease_seconds: 123,
+            expires: timestamp + 123,
             secret: None,
         });
         let storage = Arc::new(Mutex::new(storage));
@@ -918,6 +1118,7 @@ mod tests {
                 req,
                 challenge::generators::Static::new("test".to_string()),
                 &storage,
+                timestamp,
             )
             .map(|res| {
                 assert_eq!(res.status(), StatusCode::ACCEPTED);
@@ -930,6 +1131,54 @@ mod tests {
         assert_eq!(requests, 1);
 
         assert!(storage.lock().unwrap().get(callback, topic).is_none());
+    }
+
+    #[test]
+    fn content_distribution_expired() {
+        let addr = ([127, 0, 0, 1], 3007).into();
+        let (tx, rx) = futures::sync::oneshot::channel::<()>();
+        let subscriber = thread::spawn(move || {
+            let exec = runtime::current_thread::TaskExecutor::current();
+            let counter = Rc::new(Cell::new(0));
+            let counter2 = counter.clone();
+            let server = Server::bind(&addr)
+                .executor(exec)
+                .serve(move || {
+                    let cnt = counter2.clone();
+                    service_fn_ok(move |_req| {
+                        cnt.set(cnt.get() + 1);
+                        Response::new(Body::empty())
+                    })
+                })
+                .with_graceful_shutdown(rx)
+                .map_err(|err| eprintln!("server error: {}", err));
+            runtime::current_thread::Runtime::new()
+                .expect("rt new")
+                .spawn(server)
+                .run()
+                .expect("rt run");
+            counter.get()
+        });
+
+        let timestamp = 1500000000;
+
+        let mut storage = HashMapStorage::new();
+        storage.insert(Item {
+            callback: format!("http://{}", addr),
+            topic: "http://topic.local".to_string(),
+            expires: timestamp - 123,
+            secret: None,
+        });
+        let storage = Arc::new(Mutex::new(storage));
+
+        rt::run(
+            content_distribution(&storage, timestamp, "http://topic.local", "breaking news")
+                .map_err(|err| panic!(err)),
+        );
+
+        tx.send(()).unwrap();
+        let requests = subscriber.join().unwrap();
+        assert_eq!(requests, 0);
     }
 
     #[test]
@@ -972,17 +1221,19 @@ mod tests {
             counter.get()
         });
 
+        let timestamp = 1500000000;
+
         let mut storage = HashMapStorage::new();
         storage.insert(Item {
             callback: format!("http://{}", addr),
             topic: "http://topic.local".to_string(),
-            lease_seconds: 123,
+            expires: timestamp + 123,
             secret: None,
         });
         let storage = Arc::new(Mutex::new(storage));
 
         rt::run(
-            content_distribution(&storage, "http://topic.local", "breaking news")
+            content_distribution(&storage, timestamp, "http://topic.local", "breaking news")
                 .map_err(|err| panic!(err)),
         );
 
@@ -1034,17 +1285,19 @@ mod tests {
             counter.get()
         });
 
+        let timestamp = 1500000000;
+
         let mut storage = HashMapStorage::new();
         storage.insert(Item {
             callback: format!("http://{}", addr),
             topic: "http://topic.local".to_string(),
-            lease_seconds: 123,
+            expires: timestamp + 123,
             secret: Some("mysecret".to_string()),
         });
         let storage = Arc::new(Mutex::new(storage));
 
         rt::run(
-            content_distribution(&storage, "http://topic.local", "breaking news")
+            content_distribution(&storage, timestamp, "http://topic.local", "breaking news")
                 .map_err(|err| panic!(err)),
         );
 
