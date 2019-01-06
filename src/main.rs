@@ -351,6 +351,7 @@ mod tests {
     use http::request::Parts;
     use hyper::body::Chunk;
     use hyper::rt::{Future, Stream};
+    use std::borrow::Borrow;
     use std::net::SocketAddr;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::thread;
@@ -410,12 +411,29 @@ mod tests {
         }
     }
 
+    fn post_request<I, K, V>(pairs: I) -> Request<Body>
+    where
+        I: IntoIterator,
+        I::Item: Borrow<(K, V)>,
+        K: AsRef<str>,
+        V: AsRef<str>,
+    {
+        Request::builder()
+            .method(Method::POST)
+            .body(Body::from(
+                form_urlencoded::Serializer::new(String::new())
+                    .extend_pairs(pairs)
+                    .finish(),
+            ))
+            .unwrap()
+    }
+
     #[test]
     fn release_secondsquest_homepage() {
         let timestamp = 1500000000;
         let storage = Arc::new(Mutex::new(HashMapStorage::new()));
         let req = Request::builder()
-            .method("GET")
+            .method(Method::GET)
             .body(Body::empty())
             .unwrap();
         hello(
@@ -438,10 +456,7 @@ mod tests {
     fn hub_callback_required() {
         let timestamp = 1500000000;
         let storage = Arc::new(Mutex::new(HashMapStorage::new()));
-        let req = Request::builder()
-            .method("POST")
-            .body(Body::from(""))
-            .unwrap();
+        let req = post_request::<_, &str, &str>(&[]);
         hello(
             req,
             challenge::generators::Static::new("test".to_string()),
@@ -462,14 +477,7 @@ mod tests {
     fn hub_mode_required() {
         let timestamp = 1500000000;
         let storage = Arc::new(Mutex::new(HashMapStorage::new()));
-        let req = Request::builder()
-            .method("POST")
-            .body(Body::from(
-                form_urlencoded::Serializer::new(String::new())
-                    .append_pair("hub.callback", "http://callback.local")
-                    .finish(),
-            ))
-            .unwrap();
+        let req = post_request(&[("hub.callback", "http://callback.local")]);
         hello(
             req,
             challenge::generators::Static::new("test".to_string()),
@@ -490,16 +498,11 @@ mod tests {
     fn hub_mode_invalid() {
         let timestamp = 1500000000;
         let storage = Arc::new(Mutex::new(HashMapStorage::new()));
-        let req = Request::builder()
-            .method("POST")
-            .body(Body::from(
-                form_urlencoded::Serializer::new(String::new())
-                    .append_pair("hub.callback", "http://callback.local")
-                    .append_pair("hub.mode", "asd")
-                    .append_pair("hub.topic", "http://topic.local")
-                    .finish(),
-            ))
-            .unwrap();
+        let req = post_request(&[
+            ("hub.callback", "http://callback.local"),
+            ("hub.mode", "asd"),
+            ("hub.topic", "http://topic.local"),
+        ]);
         hello(
             req,
             challenge::generators::Static::new("test".to_string()),
@@ -523,15 +526,10 @@ mod tests {
     fn hub_topic_required() {
         let timestamp = 1500000000;
         let storage = Arc::new(Mutex::new(HashMapStorage::new()));
-        let req = Request::builder()
-            .method("POST")
-            .body(Body::from(
-                form_urlencoded::Serializer::new(String::new())
-                    .append_pair("hub.callback", "http://callback.local")
-                    .append_pair("hub.mode", "subscribe")
-                    .finish(),
-            ))
-            .unwrap();
+        let req = post_request(&[
+            ("hub.callback", "http://callback.local"),
+            ("hub.mode", "subscribe"),
+        ]);
         hello(
             req,
             challenge::generators::Static::new("test".to_string()),
@@ -552,16 +550,11 @@ mod tests {
     fn hub_callback_not_http() {
         let timestamp = 1500000000;
         let storage = Arc::new(Mutex::new(HashMapStorage::new()));
-        let req = Request::builder()
-            .method("POST")
-            .body(Body::from(
-                form_urlencoded::Serializer::new(String::new())
-                    .append_pair("hub.callback", "gopher://callback.local")
-                    .append_pair("hub.mode", "subscribe")
-                    .append_pair("hub.topic", "http://topic.local")
-                    .finish(),
-            ))
-            .unwrap();
+        let req = post_request(&[
+            ("hub.callback", "gopher://callback.local"),
+            ("hub.mode", "subscribe"),
+            ("hub.topic", "http://topic.local"),
+        ]);
         hello(
             req,
             challenge::generators::Static::new("test".to_string()),
@@ -585,16 +578,11 @@ mod tests {
     fn hub_callback_not_url() {
         let timestamp = 1500000000;
         let storage = Arc::new(Mutex::new(HashMapStorage::new()));
-        let req = Request::builder()
-            .method("POST")
-            .body(Body::from(
-                form_urlencoded::Serializer::new(String::new())
-                    .append_pair("hub.callback", "garbage")
-                    .append_pair("hub.mode", "subscribe")
-                    .append_pair("hub.topic", "http://topic.local")
-                    .finish(),
-            ))
-            .unwrap();
+        let req = post_request(&[
+            ("hub.callback", "garbage"),
+            ("hub.mode", "subscribe"),
+            ("hub.topic", "http://topic.local"),
+        ]);
         hello(
             req,
             challenge::generators::Static::new("test".to_string()),
@@ -618,16 +606,11 @@ mod tests {
     fn hub_topic_not_http() {
         let timestamp = 1500000000;
         let storage = Arc::new(Mutex::new(HashMapStorage::new()));
-        let req = Request::builder()
-            .method("POST")
-            .body(Body::from(
-                form_urlencoded::Serializer::new(String::new())
-                    .append_pair("hub.callback", "http://callback.local")
-                    .append_pair("hub.mode", "subscribe")
-                    .append_pair("hub.topic", "gopher://topic.local")
-                    .finish(),
-            ))
-            .unwrap();
+        let req = post_request(&[
+            ("hub.callback", "http://callback.local"),
+            ("hub.mode", "subscribe"),
+            ("hub.topic", "gopher://topic.local"),
+        ]);
         hello(
             req,
             challenge::generators::Static::new("test".to_string()),
@@ -651,16 +634,11 @@ mod tests {
     fn hub_topic_not_url() {
         let timestamp = 1500000000;
         let storage = Arc::new(Mutex::new(HashMapStorage::new()));
-        let req = Request::builder()
-            .method("POST")
-            .body(Body::from(
-                form_urlencoded::Serializer::new(String::new())
-                    .append_pair("hub.callback", "http://callback.local")
-                    .append_pair("hub.mode", "subscribe")
-                    .append_pair("hub.topic", "garbage")
-                    .finish(),
-            ))
-            .unwrap();
+        let req = post_request(&[
+            ("hub.callback", "http://callback.local"),
+            ("hub.mode", "subscribe"),
+            ("hub.topic", "garbage"),
+        ]);
         hello(
             req,
             challenge::generators::Static::new("test".to_string()),
@@ -684,17 +662,12 @@ mod tests {
     fn hub_lease_seconds_not_integer() {
         let timestamp = 1500000000;
         let storage = Arc::new(Mutex::new(HashMapStorage::new()));
-        let req = Request::builder()
-            .method("POST")
-            .body(Body::from(
-                form_urlencoded::Serializer::new(String::new())
-                    .append_pair("hub.callback", "http://callback.local")
-                    .append_pair("hub.mode", "subscribe")
-                    .append_pair("hub.topic", "http://topic.local")
-                    .append_pair("hub.lease_seconds", "garbage")
-                    .finish(),
-            ))
-            .unwrap();
+        let req = post_request(&[
+            ("hub.callback", "http://callback.local"),
+            ("hub.mode", "subscribe"),
+            ("hub.topic", "http://topic.local"),
+            ("hub.lease_seconds", "garbage"),
+        ]);
         hello(
             req,
             challenge::generators::Static::new("test".to_string()),
@@ -718,17 +691,12 @@ mod tests {
     fn hub_lease_seconds_negative() {
         let timestamp = 1500000000;
         let storage = Arc::new(Mutex::new(HashMapStorage::new()));
-        let req = Request::builder()
-            .method("POST")
-            .body(Body::from(
-                form_urlencoded::Serializer::new(String::new())
-                    .append_pair("hub.callback", "http://callback.local")
-                    .append_pair("hub.mode", "subscribe")
-                    .append_pair("hub.topic", "http://topic.local")
-                    .append_pair("hub.lease_seconds", "-123")
-                    .finish(),
-            ))
-            .unwrap();
+        let req = post_request(&[
+            ("hub.callback", "http://callback.local"),
+            ("hub.mode", "subscribe"),
+            ("hub.topic", "http://topic.local"),
+            ("hub.lease_seconds", "-123"),
+        ]);
         hello(
             req,
             challenge::generators::Static::new("test".to_string()),
@@ -752,17 +720,12 @@ mod tests {
     fn hub_too_long_secret() {
         let timestamp = 1500000000;
         let storage = Arc::new(Mutex::new(HashMapStorage::new()));
-        let req = Request::builder()
-            .method("POST")
-            .body(Body::from(
-                form_urlencoded::Serializer::new(String::new())
-                    .append_pair("hub.callback", "http://callback.local")
-                    .append_pair("hub.mode", "subscribe")
-                    .append_pair("hub.topic", "http://topic.local")
-                    .append_pair("hub.secret", &"!".repeat(200))
-                    .finish(),
-            ))
-            .unwrap();
+        let req = post_request(&[
+            ("hub.callback", "http://callback.local"),
+            ("hub.mode", "subscribe"),
+            ("hub.topic", "http://topic.local"),
+            ("hub.secret", &"!".repeat(200)),
+        ]);
         hello(
             req,
             challenge::generators::Static::new("test".to_string()),
@@ -808,16 +771,11 @@ mod tests {
         let callback = format!("http://{}", server.addr());
         let topic = "http://topic.local".to_string();
 
-        let req = Request::builder()
-            .method("POST")
-            .body(Body::from(
-                form_urlencoded::Serializer::new(String::new())
-                    .append_pair("hub.callback", &callback)
-                    .append_pair("hub.mode", "subscribe")
-                    .append_pair("hub.topic", &topic)
-                    .finish(),
-            ))
-            .unwrap();
+        let req = post_request(&[
+            ("hub.callback", callback.as_str()),
+            ("hub.mode", "subscribe"),
+            ("hub.topic", topic.as_str()),
+        ]);
 
         rt::run(
             hello(
@@ -870,17 +828,12 @@ mod tests {
         let topic = "http://topic.local".to_string();
         let timestamp = 1500000000;
 
-        let req = Request::builder()
-            .method("POST")
-            .body(Body::from(
-                form_urlencoded::Serializer::new(String::new())
-                    .append_pair("hub.callback", &callback)
-                    .append_pair("hub.mode", "subscribe")
-                    .append_pair("hub.topic", &topic)
-                    .append_pair("hub.lease_seconds", "321")
-                    .finish(),
-            ))
-            .unwrap();
+        let req = post_request(&[
+            ("hub.callback", callback.as_str()),
+            ("hub.mode", "subscribe"),
+            ("hub.topic", topic.as_str()),
+            ("hub.lease_seconds", "321"),
+        ]);
 
         rt::run(
             hello(
@@ -933,17 +886,12 @@ mod tests {
         let callback = format!("http://{}", server.addr());
         let topic = "http://topic.local".to_string();
 
-        let req = Request::builder()
-            .method("POST")
-            .body(Body::from(
-                form_urlencoded::Serializer::new(String::new())
-                    .append_pair("hub.callback", &callback)
-                    .append_pair("hub.mode", "subscribe")
-                    .append_pair("hub.topic", &topic)
-                    .append_pair("hub.secret", "mysecret")
-                    .finish(),
-            ))
-            .unwrap();
+        let req = post_request(&[
+            ("hub.callback", callback.as_str()),
+            ("hub.mode", "subscribe"),
+            ("hub.topic", topic.as_str()),
+            ("hub.secret", "mysecret"),
+        ]);
 
         rt::run(
             hello(
@@ -996,16 +944,11 @@ mod tests {
         let callback = format!("http://{}", server.addr());
         let topic = "http://topic.local".to_string();
 
-        let req = Request::builder()
-            .method("POST")
-            .body(Body::from(
-                form_urlencoded::Serializer::new(String::new())
-                    .append_pair("hub.callback", &callback)
-                    .append_pair("hub.mode", "subscribe")
-                    .append_pair("hub.topic", &topic)
-                    .finish(),
-            ))
-            .unwrap();
+        let req = post_request(&[
+            ("hub.callback", callback.as_str()),
+            ("hub.mode", "subscribe"),
+            ("hub.topic", topic.as_str()),
+        ]);
 
         rt::run(
             hello(
@@ -1059,16 +1002,11 @@ mod tests {
         let callback = format!("http://{}", server.addr());
         let topic = "http://topic.local".to_string();
 
-        let req = Request::builder()
-            .method("POST")
-            .body(Body::from(
-                form_urlencoded::Serializer::new(String::new())
-                    .append_pair("hub.callback", &callback)
-                    .append_pair("hub.mode", "unsubscribe")
-                    .append_pair("hub.topic", &topic)
-                    .finish(),
-            ))
-            .unwrap();
+        let req = post_request(&[
+            ("hub.callback", callback.as_str()),
+            ("hub.mode", "unsubscribe"),
+            ("hub.topic", topic.as_str()),
+        ]);
 
         rt::run(
             hello(
