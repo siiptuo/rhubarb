@@ -163,6 +163,14 @@ fn hello(
     if req.method() != Method::POST {
         return Box::new(future::ok(homepage()));
     }
+    match req.headers().get("Content-Type").map(|v| v.as_bytes()) {
+        Some(b"application/x-www-form-urlencoded") => {}
+        _ => {
+            return Box::new(future::ok(bad_request(
+                "Content-Type header must be application/x-www-form-urlencoded",
+            )))
+        }
+    }
     let storage = storage.clone();
     let res = req.into_body().concat2().map(move |body| {
         let mut callback = None;
@@ -420,6 +428,7 @@ mod tests {
     {
         Request::builder()
             .method(Method::POST)
+            .header("Content-Type", "application/x-www-form-urlencoded")
             .body(Body::from(
                 form_urlencoded::Serializer::new(String::new())
                     .extend_pairs(pairs)
@@ -446,6 +455,33 @@ mod tests {
             assert_eq!(res.status(), StatusCode::OK);
             res.into_body().concat2().map(|body| {
                 assert_eq!(std::str::from_utf8(&body), Ok("Rhubarb"));
+            })
+        })
+        .poll()
+        .unwrap();
+    }
+
+    #[test]
+    fn hub_callback_wrong_content_type() {
+        let timestamp = 1500000000;
+        let storage = Arc::new(Mutex::new(HashMapStorage::new()));
+        let req = Request::builder()
+            .method(Method::POST)
+            .body(Body::empty())
+            .unwrap();
+        hello(
+            req,
+            challenge::generators::Static::new("test".to_string()),
+            &storage,
+            timestamp,
+        )
+        .and_then(|res| {
+            assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+            res.into_body().concat2().map(|body| {
+                assert_eq!(
+                    std::str::from_utf8(&body),
+                    Ok("Content-Type header must be application/x-www-form-urlencoded")
+                );
             })
         })
         .poll()
