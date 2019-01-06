@@ -347,12 +347,68 @@ fn main() {
 mod tests {
     use super::*;
 
+    use futures::sync::oneshot::Sender;
+    use http::request::Parts;
+    use hyper::body::Chunk;
     use hyper::rt::{Future, Stream};
-    use hyper::service::service_fn_ok;
-    use std::cell::Cell;
-    use std::rc::Rc;
+    use std::net::SocketAddr;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::thread;
-    use tokio::runtime;
+    use std::thread::JoinHandle;
+    use tokio::runtime::current_thread::Runtime;
+
+    struct TestServer {
+        thread: JoinHandle<usize>,
+        addr: SocketAddr,
+        shutdown_tx: Sender<()>,
+    }
+
+    impl TestServer {
+        fn new(func: &'static (impl Fn(Parts, Chunk) -> Response<Body> + Sync)) -> Self {
+            let (addr_tx, addr_rx) = std::sync::mpsc::channel();
+            let (shutdown_tx, shutdown_rx) = futures::sync::oneshot::channel::<()>();
+
+            let thread = thread::spawn(move || {
+                let counter = Arc::new(AtomicUsize::new(0));
+                let counter2 = counter.clone();
+
+                let server = Server::bind(&([127, 0, 0, 1], 0).into()).serve(move || {
+                    let cnt = counter2.clone();
+                    service_fn(move |req: Request<Body>| {
+                        cnt.fetch_add(1, Ordering::Relaxed);
+                        let (parts, body) = req.into_parts();
+                        body.concat2().map(move |body| func(parts, body))
+                    })
+                });
+
+                addr_tx.send(server.local_addr()).expect("addr_tx send");
+
+                let fut = server.with_graceful_shutdown(shutdown_rx);
+
+                Runtime::new()
+                    .expect("rt new")
+                    .block_on(fut)
+                    .expect("rt block on");
+
+                counter.load(Ordering::Relaxed)
+            });
+
+            Self {
+                addr: addr_rx.recv().expect("server addr rx"),
+                thread,
+                shutdown_tx,
+            }
+        }
+
+        fn addr(&self) -> SocketAddr {
+            self.addr
+        }
+
+        fn shutdown(self) -> usize {
+            self.shutdown_tx.send(()).expect("shutdown_tx send");
+            self.thread.join().expect("thread join")
+        }
+    }
 
     #[test]
     fn release_secondsquest_homepage() {
@@ -728,47 +784,28 @@ mod tests {
 
     #[test]
     fn subscribe_minimal_success() {
-        let addr = ([127, 0, 0, 1], 3004).into();
-        let (tx, rx) = futures::sync::oneshot::channel::<()>();
-        let subscriber = thread::spawn(move || {
-            let exec = runtime::current_thread::TaskExecutor::current();
-            let counter = Rc::new(Cell::new(0));
-            let counter2 = counter.clone();
-            let server = Server::bind(&addr)
-                .executor(exec)
-                .serve(move || {
-                    let cnt = counter2.clone();
-                    service_fn_ok(move |req| {
-                        let query = req.uri().query();
-                        assert!(query.is_some());
-                        let params = form_urlencoded::parse(query.unwrap().as_bytes())
-                            .into_owned()
-                            .collect::<HashMap<String, String>>();
-                        assert_eq!(params.get("hub.mode"), Some(&"subscribe".to_string()));
-                        assert_eq!(
-                            params.get("hub.topic"),
-                            Some(&"http://topic.local".to_string())
-                        );
-                        assert_eq!(params.get("hub.challenge"), Some(&"test".to_string()));
-                        assert_eq!(params.get("hub.lease_seconds"), Some(&"123".to_string()));
-                        cnt.set(cnt.get() + 1);
-                        Response::new(Body::from("test"))
-                    })
-                })
-                .with_graceful_shutdown(rx)
-                .map_err(|err| eprintln!("server error: {}", err));
-            runtime::current_thread::Runtime::new()
-                .expect("rt new")
-                .spawn(server)
-                .run()
-                .expect("rt run");
-            counter.get()
+        let server = TestServer::new(&|parts, _body| {
+            let query = parts.uri.query();
+            assert!(query.is_some());
+
+            let params = form_urlencoded::parse(query.unwrap().as_bytes())
+                .into_owned()
+                .collect::<HashMap<String, String>>();
+            assert_eq!(params.get("hub.mode"), Some(&"subscribe".to_string()));
+            assert_eq!(
+                params.get("hub.topic"),
+                Some(&"http://topic.local".to_string())
+            );
+            assert_eq!(params.get("hub.challenge"), Some(&"test".to_string()));
+            assert_eq!(params.get("hub.lease_seconds"), Some(&"123".to_string()));
+
+            Response::new(Body::from("test"))
         });
 
         let timestamp = 1500000000;
         let storage = Arc::new(Mutex::new(HashMapStorage::new()));
 
-        let callback = format!("http://{}", addr);
+        let callback = format!("http://{}", server.addr());
         let topic = "http://topic.local".to_string();
 
         let req = Request::builder()
@@ -795,8 +832,7 @@ mod tests {
             .map_err(|err| panic!(err)),
         );
 
-        tx.send(()).unwrap();
-        let requests = subscriber.join().unwrap();
+        let requests = server.shutdown();
         assert_eq!(requests, 1);
 
         let item = storage
@@ -810,46 +846,27 @@ mod tests {
 
     #[test]
     fn subscribe_with_lease_seconds_success() {
-        let addr = ([127, 0, 0, 1], 3006).into();
-        let (tx, rx) = futures::sync::oneshot::channel::<()>();
-        let subscriber = thread::spawn(move || {
-            let exec = runtime::current_thread::TaskExecutor::current();
-            let counter = Rc::new(Cell::new(0));
-            let counter2 = counter.clone();
-            let server = Server::bind(&addr)
-                .executor(exec)
-                .serve(move || {
-                    let cnt = counter2.clone();
-                    service_fn_ok(move |req| {
-                        let query = req.uri().query();
-                        assert!(query.is_some());
-                        let params = form_urlencoded::parse(query.unwrap().as_bytes())
-                            .into_owned()
-                            .collect::<HashMap<String, String>>();
-                        assert_eq!(params.get("hub.mode"), Some(&"subscribe".to_string()));
-                        assert_eq!(
-                            params.get("hub.topic"),
-                            Some(&"http://topic.local".to_string())
-                        );
-                        assert_eq!(params.get("hub.challenge"), Some(&"test".to_string()));
-                        assert_eq!(params.get("hub.lease_seconds"), Some(&"321".to_string()));
-                        cnt.set(cnt.get() + 1);
-                        Response::new(Body::from("test"))
-                    })
-                })
-                .with_graceful_shutdown(rx)
-                .map_err(|err| eprintln!("server error: {}", err));
-            runtime::current_thread::Runtime::new()
-                .expect("rt new")
-                .spawn(server)
-                .run()
-                .expect("rt run");
-            counter.get()
+        let server = TestServer::new(&|parts, _body| {
+            let query = parts.uri.query();
+            assert!(query.is_some());
+
+            let params = form_urlencoded::parse(query.unwrap().as_bytes())
+                .into_owned()
+                .collect::<HashMap<String, String>>();
+            assert_eq!(params.get("hub.mode"), Some(&"subscribe".to_string()));
+            assert_eq!(
+                params.get("hub.topic"),
+                Some(&"http://topic.local".to_string())
+            );
+            assert_eq!(params.get("hub.challenge"), Some(&"test".to_string()));
+            assert_eq!(params.get("hub.lease_seconds"), Some(&"321".to_string()));
+
+            Response::new(Body::from("test"))
         });
 
         let storage = Arc::new(Mutex::new(HashMapStorage::new()));
 
-        let callback = format!("http://{}", addr);
+        let callback = format!("http://{}", server.addr());
         let topic = "http://topic.local".to_string();
         let timestamp = 1500000000;
 
@@ -878,8 +895,7 @@ mod tests {
             .map_err(|err| panic!(err)),
         );
 
-        tx.send(()).unwrap();
-        let requests = subscriber.join().unwrap();
+        let requests = server.shutdown();
         assert_eq!(requests, 1);
 
         let item = storage
@@ -893,47 +909,28 @@ mod tests {
 
     #[test]
     fn subscribe_with_secret_success() {
-        let addr = ([127, 0, 0, 1], 3000).into();
-        let (tx, rx) = futures::sync::oneshot::channel::<()>();
-        let subscriber = thread::spawn(move || {
-            let exec = runtime::current_thread::TaskExecutor::current();
-            let counter = Rc::new(Cell::new(0));
-            let counter2 = counter.clone();
-            let server = Server::bind(&addr)
-                .executor(exec)
-                .serve(move || {
-                    let cnt = counter2.clone();
-                    service_fn_ok(move |req| {
-                        let query = req.uri().query();
-                        assert!(query.is_some());
-                        let params = form_urlencoded::parse(query.unwrap().as_bytes())
-                            .into_owned()
-                            .collect::<HashMap<String, String>>();
-                        assert_eq!(params.get("hub.mode"), Some(&"subscribe".to_string()));
-                        assert_eq!(
-                            params.get("hub.topic"),
-                            Some(&"http://topic.local".to_string())
-                        );
-                        assert_eq!(params.get("hub.challenge"), Some(&"test".to_string()));
-                        assert_eq!(params.get("hub.lease_seconds"), Some(&"123".to_string()));
-                        cnt.set(cnt.get() + 1);
-                        Response::new(Body::from("test"))
-                    })
-                })
-                .with_graceful_shutdown(rx)
-                .map_err(|err| eprintln!("server error: {}", err));
-            runtime::current_thread::Runtime::new()
-                .expect("rt new")
-                .spawn(server)
-                .run()
-                .expect("rt run");
-            counter.get()
+        let server = TestServer::new(&|parts, _body| {
+            let query = parts.uri.query();
+            assert!(query.is_some());
+
+            let params = form_urlencoded::parse(query.unwrap().as_bytes())
+                .into_owned()
+                .collect::<HashMap<String, String>>();
+            assert_eq!(params.get("hub.mode"), Some(&"subscribe".to_string()));
+            assert_eq!(
+                params.get("hub.topic"),
+                Some(&"http://topic.local".to_string())
+            );
+            assert_eq!(params.get("hub.challenge"), Some(&"test".to_string()));
+            assert_eq!(params.get("hub.lease_seconds"), Some(&"123".to_string()));
+
+            Response::new(Body::from("test"))
         });
 
         let timestamp = 1500000000;
         let storage = Arc::new(Mutex::new(HashMapStorage::new()));
 
-        let callback = format!("http://{}", addr);
+        let callback = format!("http://{}", server.addr());
         let topic = "http://topic.local".to_string();
 
         let req = Request::builder()
@@ -961,8 +958,7 @@ mod tests {
             .map_err(|err| panic!(err)),
         );
 
-        tx.send(()).unwrap();
-        let requests = subscriber.join().unwrap();
+        let requests = server.shutdown();
         assert_eq!(requests, 1);
 
         let item = storage
@@ -976,47 +972,28 @@ mod tests {
 
     #[test]
     fn subscribe_invalid_response() {
-        let addr = ([127, 0, 0, 1], 3001).into();
-        let (tx, rx) = futures::sync::oneshot::channel::<()>();
-        let subscriber = thread::spawn(move || {
-            let exec = runtime::current_thread::TaskExecutor::current();
-            let counter = Rc::new(Cell::new(0));
-            let counter2 = counter.clone();
-            let server = Server::bind(&addr)
-                .executor(exec)
-                .serve(move || {
-                    let cnt = counter2.clone();
-                    service_fn_ok(move |req| {
-                        let query = req.uri().query();
-                        assert!(query.is_some());
-                        let params = form_urlencoded::parse(query.unwrap().as_bytes())
-                            .into_owned()
-                            .collect::<HashMap<String, String>>();
-                        assert_eq!(params.get("hub.mode"), Some(&"subscribe".to_string()));
-                        assert_eq!(
-                            params.get("hub.topic"),
-                            Some(&"http://topic.local".to_string())
-                        );
-                        assert_eq!(params.get("hub.challenge"), Some(&"test".to_string()));
-                        assert_eq!(params.get("hub.lease_seconds"), Some(&"123".to_string()));
-                        cnt.set(cnt.get() + 1);
-                        Response::new(Body::from("invalid"))
-                    })
-                })
-                .with_graceful_shutdown(rx)
-                .map_err(|err| eprintln!("server error: {}", err));
-            runtime::current_thread::Runtime::new()
-                .expect("rt new")
-                .spawn(server)
-                .run()
-                .expect("rt run");
-            counter.get()
+        let server = TestServer::new(&|parts, _body| {
+            let query = parts.uri.query();
+            assert!(query.is_some());
+
+            let params = form_urlencoded::parse(query.unwrap().as_bytes())
+                .into_owned()
+                .collect::<HashMap<String, String>>();
+            assert_eq!(params.get("hub.mode"), Some(&"subscribe".to_string()));
+            assert_eq!(
+                params.get("hub.topic"),
+                Some(&"http://topic.local".to_string())
+            );
+            assert_eq!(params.get("hub.challenge"), Some(&"test".to_string()));
+            assert_eq!(params.get("hub.lease_seconds"), Some(&"123".to_string()));
+
+            Response::new(Body::from("invalid"))
         });
 
         let timestamp = 1500000000;
         let storage = Arc::new(Mutex::new(HashMapStorage::new()));
 
-        let callback = format!("http://{}", addr);
+        let callback = format!("http://{}", server.addr());
         let topic = "http://topic.local".to_string();
 
         let req = Request::builder()
@@ -1043,8 +1020,7 @@ mod tests {
             .map_err(|err| panic!(err)),
         );
 
-        tx.send(()).unwrap();
-        let requests = subscriber.join().unwrap();
+        let requests = server.shutdown();
         assert_eq!(requests, 1);
 
         assert!(storage.lock().unwrap().get(callback, topic).is_none());
@@ -1052,54 +1028,35 @@ mod tests {
 
     #[test]
     fn unsubscribe_success() {
-        let addr = ([127, 0, 0, 1], 3003).into();
-        let (tx, rx) = futures::sync::oneshot::channel::<()>();
-        let subscriber = thread::spawn(move || {
-            let exec = runtime::current_thread::TaskExecutor::current();
-            let counter = Rc::new(Cell::new(0));
-            let counter2 = counter.clone();
-            let server = Server::bind(&addr)
-                .executor(exec)
-                .serve(move || {
-                    let cnt = counter2.clone();
-                    service_fn_ok(move |req| {
-                        let query = req.uri().query();
-                        assert!(query.is_some());
-                        let params = form_urlencoded::parse(query.unwrap().as_bytes())
-                            .into_owned()
-                            .collect::<HashMap<String, String>>();
-                        assert_eq!(params.get("hub.mode"), Some(&"unsubscribe".to_string()));
-                        assert_eq!(
-                            params.get("hub.topic"),
-                            Some(&"http://topic.local".to_string())
-                        );
-                        assert_eq!(params.get("hub.challenge"), Some(&"test".to_string()));
-                        cnt.set(cnt.get() + 1);
-                        Response::new(Body::from("test"))
-                    })
-                })
-                .with_graceful_shutdown(rx)
-                .map_err(|err| eprintln!("server error: {}", err));
-            runtime::current_thread::Runtime::new()
-                .expect("rt new")
-                .spawn(server)
-                .run()
-                .expect("rt run");
-            counter.get()
+        let server = TestServer::new(&|parts, _body| {
+            let query = parts.uri.query();
+            assert!(query.is_some());
+
+            let params = form_urlencoded::parse(query.unwrap().as_bytes())
+                .into_owned()
+                .collect::<HashMap<String, String>>();
+            assert_eq!(params.get("hub.mode"), Some(&"unsubscribe".to_string()));
+            assert_eq!(
+                params.get("hub.topic"),
+                Some(&"http://topic.local".to_string())
+            );
+            assert_eq!(params.get("hub.challenge"), Some(&"test".to_string()));
+
+            Response::new(Body::from("test"))
         });
 
         let timestamp = 1500000000;
 
         let mut storage = HashMapStorage::new();
         storage.insert(Item {
-            callback: format!("http://{}", addr),
+            callback: format!("http://{}", server.addr()),
             topic: "http://topic.local".to_string(),
             expires: timestamp + 123,
             secret: None,
         });
         let storage = Arc::new(Mutex::new(storage));
 
-        let callback = format!("http://{}", addr);
+        let callback = format!("http://{}", server.addr());
         let topic = "http://topic.local".to_string();
 
         let req = Request::builder()
@@ -1126,8 +1083,7 @@ mod tests {
             .map_err(|err| panic!(err)),
         );
 
-        tx.send(()).unwrap();
-        let requests = subscriber.join().unwrap();
+        let requests = server.shutdown();
         assert_eq!(requests, 1);
 
         assert!(storage.lock().unwrap().get(callback, topic).is_none());
@@ -1135,36 +1091,13 @@ mod tests {
 
     #[test]
     fn content_distribution_expired() {
-        let addr = ([127, 0, 0, 1], 3007).into();
-        let (tx, rx) = futures::sync::oneshot::channel::<()>();
-        let subscriber = thread::spawn(move || {
-            let exec = runtime::current_thread::TaskExecutor::current();
-            let counter = Rc::new(Cell::new(0));
-            let counter2 = counter.clone();
-            let server = Server::bind(&addr)
-                .executor(exec)
-                .serve(move || {
-                    let cnt = counter2.clone();
-                    service_fn_ok(move |_req| {
-                        cnt.set(cnt.get() + 1);
-                        Response::new(Body::empty())
-                    })
-                })
-                .with_graceful_shutdown(rx)
-                .map_err(|err| eprintln!("server error: {}", err));
-            runtime::current_thread::Runtime::new()
-                .expect("rt new")
-                .spawn(server)
-                .run()
-                .expect("rt run");
-            counter.get()
-        });
+        let server = TestServer::new(&|_parts, _body| Response::new(Body::empty()));
 
         let timestamp = 1500000000;
 
         let mut storage = HashMapStorage::new();
         storage.insert(Item {
-            callback: format!("http://{}", addr),
+            callback: format!("http://{}", server.addr()),
             topic: "http://topic.local".to_string(),
             expires: timestamp - 123,
             secret: None,
@@ -1176,56 +1109,32 @@ mod tests {
                 .map_err(|err| panic!(err)),
         );
 
-        tx.send(()).unwrap();
-        let requests = subscriber.join().unwrap();
+        let requests = server.shutdown();
         assert_eq!(requests, 0);
     }
 
     #[test]
     fn content_distribution_success() {
-        let addr = ([127, 0, 0, 1], 3002).into();
-        let (tx, rx) = futures::sync::oneshot::channel::<()>();
-        let subscriber = thread::spawn(move || {
-            let exec = runtime::current_thread::TaskExecutor::current();
-            let counter = Rc::new(Cell::new(0));
-            let counter2 = counter.clone();
-            let server = Server::bind(&addr)
-                .executor(exec)
-                .serve(move || {
-                    let cnt = counter2.clone();
-                    service_fn(move |req: Request<Body>| {
-                        cnt.set(cnt.get() + 1);
+        let server = TestServer::new(&|parts, body| {
+            assert_eq!(parts.method, Method::POST);
+            assert_eq!(
+                parts.headers.get("Link"),
+                Some(&HeaderValue::from_static(
+                    "<TODO>; rel=hub, <http://topic.local>; rel=self"
+                ))
+            );
+            assert!(parts.headers.get("X-Hub-Signature").is_none());
 
-                        assert_eq!(req.method(), Method::POST);
-                        assert_eq!(
-                            req.headers().get("Link"),
-                            Some(&HeaderValue::from_static(
-                                "<TODO>; rel=hub, <http://topic.local>; rel=self"
-                            ))
-                        );
-                        assert!(req.headers().get("X-Hub-Signature").is_none());
+            assert_eq!(std::str::from_utf8(&body), Ok("breaking news"));
 
-                        req.into_body().concat2().map(move |body| {
-                            assert_eq!(std::str::from_utf8(&body), Ok("breaking news"));
-                            Response::new(Body::empty())
-                        })
-                    })
-                })
-                .with_graceful_shutdown(rx)
-                .map_err(|err| eprintln!("server error: {}", err));
-            runtime::current_thread::Runtime::new()
-                .expect("rt new")
-                .spawn(server)
-                .run()
-                .expect("rt run");
-            counter.get()
+            Response::new(Body::empty())
         });
 
         let timestamp = 1500000000;
 
         let mut storage = HashMapStorage::new();
         storage.insert(Item {
-            callback: format!("http://{}", addr),
+            callback: format!("http://{}", server.addr()),
             topic: "http://topic.local".to_string(),
             expires: timestamp + 123,
             secret: None,
@@ -1237,59 +1146,35 @@ mod tests {
                 .map_err(|err| panic!(err)),
         );
 
-        tx.send(()).unwrap();
-        let requests = subscriber.join().unwrap();
+        let requests = server.shutdown();
         assert_eq!(requests, 1);
     }
 
     #[test]
     fn authenticated_content_distribution_success() {
-        let addr = ([127, 0, 0, 1], 3005).into();
-        let (tx, rx) = futures::sync::oneshot::channel::<()>();
-        let subscriber = thread::spawn(move || {
-            let exec = runtime::current_thread::TaskExecutor::current();
-            let counter = Rc::new(Cell::new(0));
-            let counter2 = counter.clone();
-            let server = Server::bind(&addr)
-                .executor(exec)
-                .serve(move || {
-                    let cnt = counter2.clone();
-                    service_fn(move |req: Request<Body>| {
-                        cnt.set(cnt.get() + 1);
+        let server = TestServer::new(&|parts, body| {
+            assert_eq!(parts.method, Method::POST);
+            assert_eq!(
+                parts.headers.get("Link"),
+                Some(&HeaderValue::from_static(
+                    "<TODO>; rel=hub, <http://topic.local>; rel=self"
+                ))
+            );
+            assert_eq!(
+                parts.headers.get("X-Hub-Signature"),
+                Some(&HeaderValue::from_static("sha512=0f18aaef5a69a9bce743a284ffd054cb24a9faa349931f338015d32d0e37c2c01c4a95afc4173f5cc57e4c161c528dd68e13f0f00e37036224feaf438b2fd49b"))
+            );
 
-                        assert_eq!(req.method(), Method::POST);
-                        assert_eq!(
-                            req.headers().get("Link"),
-                            Some(&HeaderValue::from_static(
-                                "<TODO>; rel=hub, <http://topic.local>; rel=self"
-                            ))
-                        );
-                        assert_eq!(
-                            req.headers().get("X-Hub-Signature"),
-                            Some(&HeaderValue::from_static("sha512=0f18aaef5a69a9bce743a284ffd054cb24a9faa349931f338015d32d0e37c2c01c4a95afc4173f5cc57e4c161c528dd68e13f0f00e37036224feaf438b2fd49b"))
-                        );
+            assert_eq!(std::str::from_utf8(&body), Ok("breaking news"));
 
-                        req.into_body().concat2().map(move |body| {
-                            assert_eq!(std::str::from_utf8(&body), Ok("breaking news"));
-                            Response::new(Body::empty())
-                        })
-                    })
-                })
-                .with_graceful_shutdown(rx)
-                .map_err(|err| eprintln!("server error: {}", err));
-            runtime::current_thread::Runtime::new()
-                .expect("rt new")
-                .spawn(server)
-                .run()
-                .expect("rt run");
-            counter.get()
+            Response::new(Body::empty())
         });
 
         let timestamp = 1500000000;
 
         let mut storage = HashMapStorage::new();
         storage.insert(Item {
-            callback: format!("http://{}", addr),
+            callback: format!("http://{}", server.addr()),
             topic: "http://topic.local".to_string(),
             expires: timestamp + 123,
             secret: Some("mysecret".to_string()),
@@ -1301,8 +1186,7 @@ mod tests {
                 .map_err(|err| panic!(err)),
         );
 
-        tx.send(()).unwrap();
-        let requests = subscriber.join().unwrap();
+        let requests = server.shutdown();
         assert_eq!(requests, 1);
     }
 }
