@@ -62,21 +62,21 @@ pub fn hello(
                 "hub.callback" => match Url::parse(&value) {
                     Ok(url) => match url.scheme() {
                         "http" | "https" => callback = Some(value),
-                        _ => return bad_request("hub.callback should be a HTTP or HTTPS URL"),
+                        _ => return bad_request("hub.callback must be an HTTP or HTTPS URL"),
                     },
-                    Err(_) => return bad_request("hub.callback should be a HTTP or HTTPS URL"),
+                    Err(_) => return bad_request("hub.callback must be an HTTP or HTTPS URL"),
                 },
                 "hub.mode" => match value.as_ref() {
                     "subscribe" => mode = Some(Mode::Subscribe),
                     "unsubscribe" => mode = Some(Mode::Unsubscribe),
-                    _ => return bad_request("hub.mode should be subscribe or unsubscribe"),
+                    _ => return bad_request("hub.mode must be subscribe or unsubscribe"),
                 },
                 "hub.topic" => match Url::parse(&value) {
                     Ok(url) => match url.scheme() {
                         "http" | "https" => topic = Some(value),
-                        _ => return bad_request("hub.topic should be a HTTP or HTTPS URL"),
+                        _ => return bad_request("hub.topic must be an HTTP or HTTPS URL"),
                     },
-                    Err(_) => return bad_request("hub.topic should be a HTTP or HTTPS URL"),
+                    Err(_) => return bad_request("hub.topic must be an HTTP or HTTPS URL"),
                 },
                 "hub.lease_seconds" => match &value.parse::<u64>() {
                     Ok(val) => lease_seconds = *val,

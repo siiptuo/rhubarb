@@ -102,7 +102,7 @@ fn hub_mode_invalid() {
         res.into_body().concat2().map(|body| {
             assert_eq!(
                 std::str::from_utf8(&body),
-                Ok("hub.mode should be subscribe or unsubscribe")
+                Ok("hub.mode must be subscribe or unsubscribe")
             );
         })
     })
@@ -154,7 +154,7 @@ fn hub_callback_not_http() {
         res.into_body().concat2().map(|body| {
             assert_eq!(
                 std::str::from_utf8(&body),
-                Ok("hub.callback should be a HTTP or HTTPS URL")
+                Ok("hub.callback must be an HTTP or HTTPS URL")
             );
         })
     })
@@ -182,7 +182,7 @@ fn hub_callback_not_url() {
         res.into_body().concat2().map(|body| {
             assert_eq!(
                 std::str::from_utf8(&body),
-                Ok("hub.callback should be a HTTP or HTTPS URL")
+                Ok("hub.callback must be an HTTP or HTTPS URL")
             );
         })
     })
@@ -210,7 +210,7 @@ fn hub_topic_not_http() {
         res.into_body().concat2().map(|body| {
             assert_eq!(
                 std::str::from_utf8(&body),
-                Ok("hub.topic should be a HTTP or HTTPS URL")
+                Ok("hub.topic must be an HTTP or HTTPS URL")
             );
         })
     })
@@ -238,7 +238,7 @@ fn hub_topic_not_url() {
         res.into_body().concat2().map(|body| {
             assert_eq!(
                 std::str::from_utf8(&body),
-                Ok("hub.topic should be a HTTP or HTTPS URL")
+                Ok("hub.topic must be an HTTP or HTTPS URL")
             );
         })
     })
