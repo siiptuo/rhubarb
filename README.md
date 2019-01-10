@@ -1,5 +1,7 @@
 # Rhubarb
 
+[![Build Status](https://travis-ci.com/siiptuo/rhubarb.svg?branch=master)](https://travis-ci.com/siiptuo/rhubarb)
+
 Rhubarb is a WebSub (formerly PubSubHubbub) hub.
 
 ## Links
