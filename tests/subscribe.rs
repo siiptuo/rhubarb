@@ -61,7 +61,10 @@ fn hub_callback_wrong_content_type() {
 fn hub_callback_required() {
     let timestamp = 1500000000;
     let storage = Arc::new(Mutex::new(storage::storages::HashMap::new()));
-    let req = post_request::<_, &str, &str>(&[]);
+    let req = post_request(&[
+        ("hub.mode", "subscribe"),
+        ("hub.topic", "http://topic.local"),
+    ]);
     hello(
         req,
         challenge::generators::Static::new("test".to_string()),
@@ -82,7 +85,10 @@ fn hub_callback_required() {
 fn hub_mode_required() {
     let timestamp = 1500000000;
     let storage = Arc::new(Mutex::new(storage::storages::HashMap::new()));
-    let req = post_request(&[("hub.callback", "http://callback.local")]);
+    let req = post_request(&[
+        ("hub.callback", "http://callback.local"),
+        ("hub.topic", "http://topic.local"),
+    ]);
     hello(
         req,
         challenge::generators::Static::new("test".to_string()),
@@ -119,7 +125,7 @@ fn hub_mode_invalid() {
         res.into_body().concat2().map(|body| {
             assert_eq!(
                 std::str::from_utf8(&body),
-                Ok("hub.mode must be subscribe or unsubscribe")
+                Ok("hub.mode must be subscribe, unsubscribe or publish")
             );
         })
     })

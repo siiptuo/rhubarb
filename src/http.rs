@@ -48,6 +48,7 @@ fn accepted() -> Response<Body> {
 enum Mode {
     Subscribe,
     Unsubscribe,
+    Publish,
 }
 
 pub fn hello(
@@ -74,6 +75,7 @@ pub fn hello(
         let mut topic = None;
         let mut lease_seconds = 123;
         let mut secret = None;
+        let mut url = None;
         for (name, value) in form_urlencoded::parse(&body) {
             match name.as_ref() {
                 "hub.callback" => match Url::parse(&value) {
@@ -86,7 +88,8 @@ pub fn hello(
                 "hub.mode" => match value.as_ref() {
                     "subscribe" => mode = Some(Mode::Subscribe),
                     "unsubscribe" => mode = Some(Mode::Unsubscribe),
-                    _ => return bad_request("hub.mode must be subscribe or unsubscribe"),
+                    "publish" => mode = Some(Mode::Publish),
+                    _ => return bad_request("hub.mode must be subscribe, unsubscribe or publish"),
                 },
                 "hub.topic" => match Url::parse(&value) {
                     Ok(url) => match url.scheme() {
@@ -106,63 +109,113 @@ pub fn hello(
                         return bad_request("hub.secret must be less than 200 bytes in length");
                     }
                 }
+                "hub.url" => match Url::parse(&value) {
+                    Ok(url2) => match url2.scheme() {
+                        "http" | "https" => url = Some(value),
+                        _ => return bad_request("hub.url must be an HTTP or HTTPS URL"),
+                    },
+                    Err(_) => return bad_request("hub.url must be an HTTP or HTTPS URL"),
+                },
                 _ => {}
             }
         }
-        match (callback, mode, topic) {
-            (None, _, _) => bad_request("hub.callback required"),
-            (_, None, _) => bad_request("hub.mode required"),
-            (_, _, None) => bad_request("hub.topic required"),
-            (Some(callback), Some(mode), Some(topic)) => {
-                // Verification of intent
-                let challenge = challenge_generator.generate();
-                let verification = Url::parse_with_params(
-                    &callback,
-                    &[
-                        (
-                            "hub.mode",
-                            match mode {
-                                Mode::Subscribe => "subscribe",
-                                Mode::Unsubscribe => "unsubscribe",
-                            },
-                        ),
-                        ("hub.topic", topic.as_ref()),
-                        ("hub.challenge", challenge.as_str()),
-                        ("hub.lease_seconds", &lease_seconds.to_string()),
-                    ],
-                )
-                .unwrap();
-                let callback = callback.to_string();
-                let topic = topic.to_string();
-                let req = Client::new()
-                    .get(verification.into_string().parse().unwrap())
-                    .and_then(move |res| {
-                        res.into_body().concat2().map(move |body| {
-                            if body.as_ref() == challenge.as_bytes() {
-                                println!("callback ok: challenge accepted");
-                                match mode {
-                                    Mode::Subscribe => storage.lock().unwrap().insert(Item {
-                                        callback,
-                                        topic,
-                                        expires: timestamp + lease_seconds,
-                                        secret,
-                                    }),
-                                    Mode::Unsubscribe => storage.lock().unwrap().remove(Item {
-                                        callback,
-                                        topic,
-                                        expires: timestamp + lease_seconds,
-                                        secret,
-                                    }),
-                                }
-                            } else {
-                                println!("callback failed: invalid challenge");
-                            }
-                        })
-                    })
-                    .map_err(|err| eprintln!("callback failed: {}", err));
-                rt::spawn(req);
+        match mode {
+            None => bad_request("hub.mode required"),
+            Some(Mode::Publish) => match url {
+                None => bad_request("at least one hub.url is required"),
+                Some(url) => {
+                    let url = url.to_string();
+                    let callbacks = storage.lock().unwrap().list(&url);
+                    if !callbacks.is_empty() {
+                        let res = Client::new()
+                            .get((*url).parse().unwrap())
+                            .map_err(|err| eprintln!("fetch failed: {:?}", err))
+                            .and_then(move |res| {
+                                let (parts, body) = res.into_parts();
+                                body.concat2()
+                                    .map_err(|err| eprintln!("fetch body failed: {:?}", err))
+                                    .and_then(move |body| {
+                                        content_distribution(
+                                            &storage,
+                                            timestamp,
+                                            &url,
+                                            std::str::from_utf8(&body).unwrap(),
+                                            parts
+                                                .headers
+                                                .get("Content-Type")
+                                                .map(|val| val.to_str().unwrap())
+                                                .unwrap(),
+                                        )
+                                    })
+                            })
+                            .map_err(|err| eprintln!("content distribution failed: {:?}", err));
+                        rt::spawn(res);
+                    }
+                    accepted()
+                }
+            },
+            Some(mode) => {
+                match (callback, topic) {
+                    (None, _) => bad_request("hub.callback required"),
+                    (_, None) => bad_request("hub.topic required"),
+                    (Some(callback), Some(topic)) => {
+                        // Verification of intent
+                        let challenge = challenge_generator.generate();
+                        let verification = Url::parse_with_params(
+                            &callback,
+                            &[
+                                (
+                                    "hub.mode",
+                                    match mode {
+                                        Mode::Subscribe => "subscribe",
+                                        Mode::Unsubscribe => "unsubscribe",
+                                        Mode::Publish => unreachable!(),
+                                    },
+                                ),
+                                ("hub.topic", topic.as_ref()),
+                                ("hub.challenge", challenge.as_str()),
+                                ("hub.lease_seconds", &lease_seconds.to_string()),
+                            ],
+                        )
+                        .unwrap();
+                        let callback = callback.to_string();
+                        let topic = topic.to_string();
+                        let req = Client::new()
+                            .get(verification.into_string().parse().unwrap())
+                            .and_then(move |res| {
+                                res.into_body().concat2().map(move |body| {
+                                    if body.as_ref() == challenge.as_bytes() {
+                                        println!("callback ok: challenge accepted");
+                                        match mode {
+                                            Mode::Subscribe => {
+                                                storage.lock().unwrap().insert(Item {
+                                                    callback,
+                                                    topic,
+                                                    expires: timestamp + lease_seconds,
+                                                    secret,
+                                                })
+                                            }
+                                            Mode::Unsubscribe => {
+                                                storage.lock().unwrap().remove(Item {
+                                                    callback,
+                                                    topic,
+                                                    expires: timestamp + lease_seconds,
+                                                    secret,
+                                                })
+                                            }
+                                            Mode::Publish => unreachable!(),
+                                        }
+                                    } else {
+                                        println!("callback failed: invalid challenge");
+                                    }
+                                })
+                            })
+                            .map_err(|err| eprintln!("callback failed: {}", err));
+                        rt::spawn(req);
 
-                accepted()
+                        accepted()
+                    }
+                }
             }
         }
     });
@@ -174,6 +227,7 @@ pub fn content_distribution(
     timestamp: u64,
     topic: &str,
     content: &str,
+    content_type: &str,
 ) -> Box<Future<Item = (), Error = ()> + Send> {
     let subscribers: Vec<(String, Option<String>)> = storage
         .lock()
@@ -185,12 +239,14 @@ pub fn content_distribution(
         .collect();
     let topic = topic.to_string();
     let content = content.to_string();
+    let content_type = content_type.to_string();
     Box::new(future::lazy(move || {
         for (callback, secret) in subscribers {
             let callback2 = callback.clone();
             let client = Client::new();
             let mut req = Request::post(&callback)
                 .header("Link", format!("<TODO>; rel=hub, <{}>; rel=self", topic))
+                .header("Content-Type", content_type.as_str())
                 .body(Body::from(content.clone()))
                 .unwrap();
             if let Some(secret) = secret {

@@ -43,8 +43,14 @@ fn content_distribution_expired() {
     let storage = Arc::new(Mutex::new(storage));
 
     rt::run(
-        content_distribution(&storage, timestamp, "http://topic.local", "breaking news")
-            .map_err(|err| panic!(err)),
+        content_distribution(
+            &storage,
+            timestamp,
+            "http://topic.local",
+            "breaking news",
+            "text/plain",
+        )
+        .map_err(|err| panic!(err)),
     );
 
     let requests = server.shutdown();
@@ -60,6 +66,10 @@ fn content_distribution_success() {
             Some(&HeaderValue::from_static(
                 "<TODO>; rel=hub, <http://topic.local>; rel=self"
             ))
+        );
+        assert_eq!(
+            parts.headers.get("Content-Type"),
+            Some(&HeaderValue::from_static("text/plain"))
         );
         assert!(parts.headers.get("X-Hub-Signature").is_none());
 
@@ -80,8 +90,14 @@ fn content_distribution_success() {
     let storage = Arc::new(Mutex::new(storage));
 
     rt::run(
-        content_distribution(&storage, timestamp, "http://topic.local", "breaking news")
-            .map_err(|err| panic!(err)),
+        content_distribution(
+            &storage,
+            timestamp,
+            "http://topic.local",
+            "breaking news",
+            "text/plain",
+        )
+        .map_err(|err| panic!(err)),
     );
 
     let requests = server.shutdown();
@@ -99,9 +115,13 @@ fn authenticated_content_distribution_success() {
             ))
         );
         assert_eq!(
-                parts.headers.get("X-Hub-Signature"),
-                Some(&HeaderValue::from_static("sha512=0f18aaef5a69a9bce743a284ffd054cb24a9faa349931f338015d32d0e37c2c01c4a95afc4173f5cc57e4c161c528dd68e13f0f00e37036224feaf438b2fd49b"))
-            );
+            parts.headers.get("X-Hub-Signature"),
+            Some(&HeaderValue::from_static("sha512=0f18aaef5a69a9bce743a284ffd054cb24a9faa349931f338015d32d0e37c2c01c4a95afc4173f5cc57e4c161c528dd68e13f0f00e37036224feaf438b2fd49b"))
+        );
+        assert_eq!(
+            parts.headers.get("Content-Type"),
+            Some(&HeaderValue::from_static("text/plain"))
+        );
 
         assert_eq!(std::str::from_utf8(&body), Ok("breaking news"));
 
@@ -120,8 +140,14 @@ fn authenticated_content_distribution_success() {
     let storage = Arc::new(Mutex::new(storage));
 
     rt::run(
-        content_distribution(&storage, timestamp, "http://topic.local", "breaking news")
-            .map_err(|err| panic!(err)),
+        content_distribution(
+            &storage,
+            timestamp,
+            "http://topic.local",
+            "breaking news",
+            "text/plain",
+        )
+        .map_err(|err| panic!(err)),
     );
 
     let requests = server.shutdown();
