@@ -59,6 +59,7 @@ pub mod storages {
         }
 
         fn list(&self, topic: &str) -> Vec<Item> {
+            println!("list {}", topic);
             self.hash_map
                 .iter()
                 .filter(|(key, _val)| key.1 == topic)

@@ -21,6 +21,7 @@ use hmac::{Hmac, Mac};
 use hyper::rt::{self, Future};
 use hyper::{header::HeaderValue, Body, Client, Method, Request, Response, StatusCode};
 use sha2::Sha512;
+use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 use url::{form_urlencoded, Url};
 
@@ -75,7 +76,7 @@ pub fn hello(
         let mut topic = None;
         let mut lease_seconds = 123;
         let mut secret = None;
-        let mut url = None;
+        let mut urls = HashSet::new();
         for (name, value) in form_urlencoded::parse(&body) {
             match name.as_ref() {
                 "hub.callback" => match Url::parse(&value) {
@@ -110,8 +111,14 @@ pub fn hello(
                     }
                 }
                 "hub.url" => match Url::parse(&value) {
-                    Ok(url2) => match url2.scheme() {
-                        "http" | "https" => url = Some(value),
+                    Ok(url) => match url.scheme() {
+                        "http" | "https" => {
+                            if urls.contains(&value) {
+                                return bad_request("duplicate values of hub.url are not allowed");
+                            } else {
+                                urls.insert(value);
+                            }
+                        }
                         _ => return bad_request("hub.url must be an HTTP or HTTPS URL"),
                     },
                     Err(_) => return bad_request("hub.url must be an HTTP or HTTPS URL"),
@@ -121,14 +128,17 @@ pub fn hello(
         }
         match mode {
             None => bad_request("hub.mode required"),
-            Some(Mode::Publish) => match url {
-                None => bad_request("at least one hub.url is required"),
-                Some(url) => {
+            Some(Mode::Publish) => {
+                if urls.is_empty() {
+                    return bad_request("at least one hub.url is required");
+                }
+                for url in urls {
+                    let storage = storage.clone();
                     let url = url.to_string();
                     let callbacks = storage.lock().unwrap().list(&url);
                     if !callbacks.is_empty() {
                         let res = Client::new()
-                            .get((*url).parse().unwrap())
+                            .get(url.to_string().parse().unwrap())
                             .map_err(|err| eprintln!("fetch failed: {:?}", err))
                             .and_then(move |res| {
                                 let (parts, body) = res.into_parts();
@@ -151,9 +161,9 @@ pub fn hello(
                             .map_err(|err| eprintln!("content distribution failed: {:?}", err));
                         rt::spawn(res);
                     }
-                    accepted()
                 }
-            },
+                accepted()
+            }
             Some(mode) => {
                 match (callback, topic) {
                     (None, _) => bad_request("hub.callback required"),

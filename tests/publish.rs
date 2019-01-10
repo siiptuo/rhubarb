@@ -77,6 +77,34 @@ fn invalid_url() {
 }
 
 #[test]
+fn duplicate_urls() {
+    let timestamp = 1500000000;
+    let storage = Arc::new(Mutex::new(storage::storages::HashMap::new()));
+    let req = post_request(&[
+        ("hub.mode", "publish"),
+        ("hub.url", "http://topic.local"),
+        ("hub.url", "http://topic.local"),
+    ]);
+    hello(
+        req,
+        challenge::generators::Static::new("test".to_string()),
+        &storage,
+        timestamp,
+    )
+    .and_then(|res| {
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        res.into_body().concat2().map(|body| {
+            assert_eq!(
+                std::str::from_utf8(&body),
+                Ok("duplicate values of hub.url are not allowed")
+            );
+        })
+    })
+    .poll()
+    .unwrap();
+}
+
+#[test]
 fn no_subscribers() {
     let topic = TestServer::new(&|parts, _body| {
         assert_eq!(parts.method, Method::GET);
@@ -157,4 +185,76 @@ fn single_url_success() {
 
     assert_eq!(topic.shutdown(), 1);
     assert_eq!(subscriber.shutdown(), 1);
+}
+
+#[test]
+fn multiple_urls_success() {
+    let topic1 = TestServer::new(&|parts, _body| {
+        assert_eq!(parts.method, Method::GET);
+        Response::builder()
+            .header("Content-Type", "text/plain")
+            .body(Body::from("breaking news"))
+            .unwrap()
+    });
+
+    let topic2 = TestServer::new(&|parts, _body| {
+        assert_eq!(parts.method, Method::GET);
+        Response::builder()
+            .header("Content-Type", "text/plain")
+            .body(Body::from("another breaking news"))
+            .unwrap()
+    });
+
+    let subscriber = TestServer::new(&|parts, _body| {
+        assert_eq!(parts.method, Method::POST);
+        assert_eq!(
+            parts.headers.get("Content-Type"),
+            Some(&HeaderValue::from_static("text/plain"))
+        );
+        Response::new(Body::empty())
+    });
+
+    let topic1_url = format!("http://{}", topic1.addr());
+    let topic2_url = format!("http://{}", topic2.addr());
+    let callback = format!("http://{}/callback", subscriber.addr());
+
+    let timestamp = 1500000000;
+
+    let mut storage = storage::storages::HashMap::new();
+    storage.insert(Item {
+        callback: callback.clone(),
+        topic: topic1_url.clone(),
+        expires: timestamp + 123,
+        secret: None,
+    });
+    storage.insert(Item {
+        callback: callback.clone(),
+        topic: topic2_url.clone(),
+        expires: timestamp + 123,
+        secret: None,
+    });
+    let storage = Arc::new(Mutex::new(storage));
+
+    let req = post_request(&[
+        ("hub.mode", "publish"),
+        ("hub.url", &topic1_url),
+        ("hub.url", &topic2_url),
+    ]);
+
+    rt::run(
+        hello(
+            req,
+            challenge::generators::Static::new("test".to_string()),
+            &storage,
+            timestamp,
+        )
+        .map(|res| {
+            assert_eq!(res.status(), StatusCode::ACCEPTED);
+        })
+        .map_err(|err| panic!(err)),
+    );
+
+    assert_eq!(topic1.shutdown(), 1);
+    assert_eq!(topic2.shutdown(), 1);
+    assert_eq!(subscriber.shutdown(), 2);
 }
